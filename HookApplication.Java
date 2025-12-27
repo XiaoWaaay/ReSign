@@ -428,7 +428,6 @@ import android.content.pm.Signature;
 import android.os.Build;
 import android.os.Environment;
 import android.os.IBinder;
-import android.os.Parcel;
 import android.util.Base64;
 import android.util.Log;
 
@@ -538,7 +537,7 @@ public class HookApplication extends Application {
             sProxyIPM = proxy;
             patchActivityThreadPackageManager(proxy);
             patchApplicationPackageManager(proxy);
-            clearPackageManagerCaches();
+            clearPackageManagerInfoCache();
             Log.d(TAG, "PackageManager Binder Hook 安装完成");
         } catch (Throwable e) {
             Log.e(TAG, "PackageManager Hook 失败: " + e.getMessage(), e);
@@ -831,22 +830,13 @@ public class HookApplication extends Application {
     }
 
     /** 清理 PackageManager 缓存（可能被隐藏 API 限制拦截，忽略异常即可） */
-    private static void clearPackageManagerCaches() {
-        String[] fields = {"sPackageInfoCache", "mCreators", "sPairedCreators"};
-        for (String name : fields) {
-            try {
-                if ("sPackageInfoCache".equals(name)) {
-                    Object cache = findField(PackageManager.class, name).get(null);
-                    cache.getClass().getMethod("clear").invoke(cache);
-                } else {
-                    @SuppressWarnings("unchecked")
-                    Map<Object, Object> map = (Map<Object, Object>) findField(Parcel.class, name).get(null);
-                    map.clear();
-                }
-                Log.d(TAG, "已清理缓存: " + name);
-            } catch (Throwable e) {
-                Log.d(TAG, "清理缓存失败 " + name + ": " + e.getMessage());
+    private static void clearPackageManagerInfoCache() {
+        try {
+            Object cache = findField(PackageManager.class, "sPackageInfoCache").get(null);
+            if (cache != null) {
+                cache.getClass().getMethod("clear").invoke(cache);
             }
+        } catch (Throwable ignored) {
         }
     }
 
