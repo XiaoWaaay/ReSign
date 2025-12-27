@@ -212,26 +212,37 @@ class Injector {
 
             val content = file.readText()
 
-            val hookCode = """
+            val hookCodeInExistingClinit = """
         |
-        |    # === 注入 HookApplication 初始化 ===
-        |    :try_start_hook
+        |    :resig_try_start
         |    const-string v0, "com.xwaaa.hook.HookApplication"
         |    invoke-static {v0}, Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;
         |    move-result-object v0
-        |    
+        |
         |    const-string v1, "initSignatureHook"
         |    const/4 v2, 0x0
         |    new-array v2, v2, [Ljava/lang/Class;
         |    invoke-virtual {v0, v1, v2}, Ljava/lang/Class;->getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
         |    move-result-object v0
-        |    
+        |
+        |    const/4 v1, 0x1
+        |    invoke-virtual {v0, v1}, Ljava/lang/reflect/Method;->setAccessible(Z)V
+        |
         |    const/4 v1, 0x0
         |    invoke-virtual {v0, v1, v1}, Ljava/lang/reflect/Method;->invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
-        |    :try_end_hook
-        |    .catch Ljava/lang/Exception; {:try_start_hook .. :try_end_hook} :catch_hook
+        |    :resig_try_end
+        |    .catch Ljava/lang/Exception; {:resig_try_start .. :resig_try_end} :resig_catch
         |
-        |    :catch_hook
+        |    goto :resig_after
+        |
+        |    :resig_catch
+        |
+        |    :resig_after
+        |
+    """.trimMargin()
+
+            val hookCodeNewClinit = """
+        |$hookCodeInExistingClinit
         |    return-void
         |
     """.trimMargin()
@@ -249,7 +260,7 @@ class Injector {
                     """
             |.method static constructor <clinit>()V
             |    .registers $finalRegisters
-            |$hookCode
+            |$hookCodeInExistingClinit
             """.trimMargin()
                 }
             } else {
@@ -259,7 +270,7 @@ class Injector {
         |
         |.method static constructor <clinit>()V
         |    .registers 3
-        |$hookCode
+        |$hookCodeNewClinit
         |.end method
         """.trimMargin()
             }
