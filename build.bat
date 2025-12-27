@@ -64,6 +64,11 @@ if exist "%OUT_DIR%\dex\classes.dex" (
     echo.
     echo ✅ 编译成功！
     echo 输出文件: %OUT_DIR%\dex\classes.dex
+
+    if exist "%CURDIR%app\src\main\assets" (
+        copy /y "%OUT_DIR%\dex\classes.dex" "%CURDIR%app\src\main\assets\classesx.dex" >nul
+        echo 已同步到 assets: %CURDIR%app\src\main\assets\classesx.dex
+    )
 ) else (
     echo ❌ 未生成 classes.dex，请检查输出。
 )

@@ -5,11 +5,15 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WRAPPER="$ROOT_DIR/gradlew"
 MODULE="app"
 CLEAN=false
+DEBUG=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --clean)
       CLEAN=true
+      ;;
+    --debug)
+      DEBUG=true
       ;;
     --module)
       shift
@@ -21,18 +25,52 @@ while [ $# -gt 0 ]; do
   shift || true
 done
 
+JAVA_MAJOR=""
+if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME:-}/bin/java" ]; then
+  JAVA_MAJOR="$("$JAVA_HOME/bin/java" -version 2>&1 | head -n 1 | sed -n 's/.*version "\([0-9][0-9]*\)\..*/\1/p')"
+  if [ -z "$JAVA_MAJOR" ]; then
+    JAVA_MAJOR="$("$JAVA_HOME/bin/java" -version 2>&1 | head -n 1 | sed -n 's/.*version "1\.\([0-9][0-9]*\)\..*/\1/p')"
+  fi
+fi
+
+if [ -z "${JAVA_HOME:-}" ] || [ -z "$JAVA_MAJOR" ] || [ "$JAVA_MAJOR" -lt 17 ] || [ "$JAVA_MAJOR" -gt 21 ]; then
+  CAND="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+  if [ -d "$CAND" ]; then
+    export JAVA_HOME="$CAND"
+    export PATH="$JAVA_HOME/bin:$PATH"
+  fi
+fi
+
+if [ -z "${ANDROID_SDK_ROOT:-}" ] && [ -z "${ANDROID_HOME:-}" ]; then
+  CAND="$HOME/Library/Android/sdk"
+  if [ -d "$CAND" ]; then
+    export ANDROID_SDK_ROOT="$CAND"
+    export ANDROID_HOME="$CAND"
+  fi
+fi
+
+if [ -z "${ANDROID_SDK_HOME:-}" ]; then
+  export ANDROID_SDK_HOME="$ROOT_DIR/.android_home"
+fi
+mkdir -p "$ANDROID_SDK_HOME"
+
 if [ ! -f "$WRAPPER" ]; then
   echo "[错误] 未找到 gradlew"
   exit 1
 fi
 
-if $CLEAN; then
-  bash "$WRAPPER" clean ":$MODULE:assembleRelease" --no-daemon
-else
-  bash "$WRAPPER" ":$MODULE:assembleRelease" --no-daemon
+TASK=":$MODULE:assembleRelease"
+OUT_DIR="$ROOT_DIR/$MODULE/build/outputs/apk/release"
+if $DEBUG; then
+  TASK=":$MODULE:assembleDebug"
+  OUT_DIR="$ROOT_DIR/$MODULE/build/outputs/apk/debug"
 fi
 
-OUT_DIR="$ROOT_DIR/$MODULE/build/outputs/apk/release"
+if $CLEAN; then
+  bash "$WRAPPER" clean "$TASK" --no-daemon
+else
+  bash "$WRAPPER" "$TASK" --no-daemon
+fi
 if [ ! -d "$OUT_DIR" ]; then
   echo "[错误] 未找到输出目录: $OUT_DIR"
   exit 1
@@ -48,4 +86,8 @@ for apk in "${APKS[@]}"; do
   echo "生成: $apk"
 done
 
-echo "✅ Release 构建完成"
+if $DEBUG; then
+  echo "✅ Debug 构建完成"
+else
+  echo "✅ Release 构建完成"
+fi

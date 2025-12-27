@@ -73,6 +73,12 @@ if [ -f "$OUT_DIR/dex/classes.dex" ]; then
   echo
   echo "✅ 编译成功！"
   echo "输出文件: $OUT_DIR/dex/classes.dex"
+
+  ASSET_DIR="$CURDIR/app/src/main/assets"
+  if [ -d "$ASSET_DIR" ]; then
+    cp -f "$OUT_DIR/dex/classes.dex" "$ASSET_DIR/classesx.dex"
+    echo "已同步到 assets: $ASSET_DIR/classesx.dex"
+  fi
 else
   echo "❌ 未生成 classes.dex，请检查输出。"
   exit 1

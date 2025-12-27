@@ -43,7 +43,6 @@ android {
     tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
         kotlinOptions { jvmTarget = "1.8" }
     }
-    kotlin { jvmToolchain(8) }
 
 // 如果你之前配过 Kotlin/Java toolchain，确保也指向 8（否则删掉那段）
 //    kotlin {
@@ -121,5 +120,4 @@ dependencies {
 
 
 }
-
 
