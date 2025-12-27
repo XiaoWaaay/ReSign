@@ -428,19 +428,21 @@ import android.content.pm.Signature;
 import android.os.Build;
 import android.os.Environment;
 import android.os.IBinder;
+import android.os.IInterface;
+import android.os.Parcel;
+import android.os.RemoteException;
 import android.util.Base64;
 import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.lang.reflect.Field;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -458,9 +460,6 @@ public class HookApplication extends Application {
     private static final AtomicBoolean INIT_ONCE = new AtomicBoolean(false);
     private static final AtomicBoolean PM_HOOKED = new AtomicBoolean(false);
     private static final AtomicBoolean OPEN_HOOKED = new AtomicBoolean(false);
-
-    private static volatile Object sRawIPM;
-    private static volatile Object sProxyIPM;
 
     // 改成你实际的 so 名（lib<这里>.so）
     private static final String LIB_NAME = "killsignture";
@@ -532,104 +531,37 @@ public class HookApplication extends Application {
     /** PackageManager Hook（Java 层） **/
     private static void killPM(final String pkg, String sigBase64) {
         try {
-            Log.d(TAG, "执行 PackageManager Binder Hook...");
-            Object proxy = installPackageManagerBinderHook(pkg, sigBase64);
-            sProxyIPM = proxy;
-            patchActivityThreadPackageManager(proxy);
-            patchApplicationPackageManager(proxy);
+            Log.d(TAG, "执行 PackageManager Binder Proxy Hook...");
+
+            final Signature fakeSig = new Signature(Base64.decode(sigBase64, Base64.DEFAULT));
+
+            Class<?> smClz = Class.forName("android.os.ServiceManager");
+            Method getService = smClz.getDeclaredMethod("getService", String.class);
+            getService.setAccessible(true);
+            IBinder rawBinder = (IBinder) getService.invoke(null, "package");
+            if (rawBinder == null) {
+                Log.e(TAG, "ServiceManager.getService(\"package\") 返回 null");
+                return;
+            }
+
+            IBinder hookedBinder = new PmBinderProxy(rawBinder, pkg, fakeSig);
+
+            @SuppressWarnings("unchecked")
+            Map<String, IBinder> cache = (Map<String, IBinder>) findField(smClz, "sCache").get(null);
+            cache.put("package", hookedBinder);
+
+            Class<?> stubClz = Class.forName("android.content.pm.IPackageManager$Stub");
+            Method asInterface = stubClz.getDeclaredMethod("asInterface", IBinder.class);
+            asInterface.setAccessible(true);
+            Object ipm = asInterface.invoke(null, hookedBinder);
+
+            patchActivityThreadPackageManager(ipm);
+            patchApplicationPackageManager(ipm);
             clearPackageManagerInfoCache();
-            Log.d(TAG, "PackageManager Binder Hook 安装完成");
+            Log.d(TAG, "PackageManager Binder Proxy Hook 安装完成");
         } catch (Throwable e) {
             Log.e(TAG, "PackageManager Hook 失败: " + e.getMessage(), e);
         }
-    }
-
-    private static Object installPackageManagerBinderHook(final String targetPkg, String sigBase64) throws Throwable {
-        final Signature fakeSig = new Signature(Base64.decode(sigBase64, Base64.DEFAULT));
-
-        Class<?> smClz = Class.forName("android.os.ServiceManager");
-        Method getService = smClz.getDeclaredMethod("getService", String.class);
-        getService.setAccessible(true);
-        IBinder rawBinder = (IBinder) getService.invoke(null, "package");
-
-        Class<?> iPmClz = Class.forName("android.content.pm.IPackageManager");
-        Class<?> stubClz = Class.forName("android.content.pm.IPackageManager$Stub");
-        Method asInterface = stubClz.getDeclaredMethod("asInterface", IBinder.class);
-        asInterface.setAccessible(true);
-
-        final Object rawIPM = asInterface.invoke(null, rawBinder);
-        sRawIPM = rawIPM;
-
-        final InvocationHandler ipmHandler = new InvocationHandler() {
-            @Override
-            public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-                String name = method.getName();
-
-                if ("getClass".equals(name)) return rawIPM.getClass();
-                if ("toString".equals(name)) return rawIPM.toString();
-                if ("hashCode".equals(name)) return rawIPM.hashCode();
-                if ("equals".equals(name) && args != null && args.length == 1) return rawIPM.equals(args[0]);
-
-                if ("getPackageInfo".equals(name)
-                        || "getPackageInfoAsUser".equals(name)
-                        || "getPackageInfoVersioned".equals(name)
-                        || "getPackageInfoVersionedAsUser".equals(name)) {
-                    Object out = invokeOriginal(rawIPM, method, args);
-                    if (out instanceof PackageInfo) {
-                        PackageInfo pi = (PackageInfo) out;
-                        if (targetPkg.equals(pi.packageName)) {
-                            patchPackageInfoSignatures(pi, fakeSig);
-                        }
-                    }
-                    return out;
-                }
-
-                if ("checkSignatures".equals(name) || "checkSignaturesAsUser".equals(name)) {
-                    Object result = invokeOriginal(rawIPM, method, args);
-                    if (result instanceof Integer) {
-                        int originalResult = (Integer) result;
-                        if (originalResult != PackageManager.SIGNATURE_MATCH) return PackageManager.SIGNATURE_MATCH;
-                    }
-                    return result;
-                }
-
-                if ("hasSigningCertificate".equals(name) || "hasSigningCertificateAsUser".equals(name)) {
-                    Object result = invokeOriginal(rawIPM, method, args);
-                    if (result instanceof Boolean) {
-                        boolean originalResult = (Boolean) result;
-                        if (!originalResult) return true;
-                    }
-                    return result;
-                }
-
-                return invokeOriginal(rawIPM, method, args);
-            }
-        };
-
-        final Object proxyIPM = Proxy.newProxyInstance(HookApplication.class.getClassLoader(), new Class[]{iPmClz}, ipmHandler);
-
-        IBinder hookedBinder = (IBinder) Proxy.newProxyInstance(
-                HookApplication.class.getClassLoader(),
-                new Class[]{IBinder.class},
-                new InvocationHandler() {
-                    @Override
-                    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-                        if ("queryLocalInterface".equals(method.getName())
-                                && args != null
-                                && args.length == 1
-                                && "android.content.pm.IPackageManager".equals(args[0])) {
-                            return proxyIPM;
-                        }
-                        return invokeOriginal(rawBinder, method, args);
-                    }
-                }
-        );
-
-        @SuppressWarnings("unchecked")
-        Map<String, IBinder> cache = (Map<String, IBinder>) findField(smClz, "sCache").get(null);
-        cache.put("package", hookedBinder);
-
-        return proxyIPM;
     }
 
     private static Object invokeOriginal(Object receiver, Method method, Object[] args) throws Throwable {
@@ -639,6 +571,213 @@ public class HookApplication extends Application {
             Throwable cause = e.getCause();
             if (cause != null) throw cause;
             throw e;
+        }
+    }
+
+    private static final class PmBinderProxy implements IBinder {
+        private final IBinder base;
+        private final String targetPkg;
+        private final Signature fakeSig;
+
+        private final int codeGetPackageInfo;
+        private final int codeGetPackageInfoAsUser;
+        private final int codeGetPackageInfoVersioned;
+        private final int codeGetPackageInfoVersionedAsUser;
+        private final int codeCheckSignatures;
+        private final int codeCheckSignaturesAsUser;
+        private final int codeHasSigningCertificate;
+        private final int codeHasSigningCertificateAsUser;
+
+        PmBinderProxy(IBinder base, String targetPkg, Signature fakeSig) {
+            this.base = base;
+            this.targetPkg = targetPkg;
+            this.fakeSig = fakeSig;
+
+            int gp = -1;
+            int gpa = -1;
+            int gpv = -1;
+            int gpva = -1;
+            int cs = -1;
+            int csa = -1;
+            int hsc = -1;
+            int hsca = -1;
+            try {
+                Class<?> stubClz = Class.forName("android.content.pm.IPackageManager$Stub");
+                gp = readStaticIntSafely(stubClz, "TRANSACTION_getPackageInfo");
+                gpa = readStaticIntSafely(stubClz, "TRANSACTION_getPackageInfoAsUser");
+                gpv = readStaticIntSafely(stubClz, "TRANSACTION_getPackageInfoVersioned");
+                gpva = readStaticIntSafely(stubClz, "TRANSACTION_getPackageInfoVersionedAsUser");
+                cs = readStaticIntSafely(stubClz, "TRANSACTION_checkSignatures");
+                csa = readStaticIntSafely(stubClz, "TRANSACTION_checkSignaturesAsUser");
+                hsc = readStaticIntSafely(stubClz, "TRANSACTION_hasSigningCertificate");
+                hsca = readStaticIntSafely(stubClz, "TRANSACTION_hasSigningCertificateAsUser");
+            } catch (Throwable ignored) {
+            }
+            this.codeGetPackageInfo = gp;
+            this.codeGetPackageInfoAsUser = gpa;
+            this.codeGetPackageInfoVersioned = gpv;
+            this.codeGetPackageInfoVersionedAsUser = gpva;
+            this.codeCheckSignatures = cs;
+            this.codeCheckSignaturesAsUser = csa;
+            this.codeHasSigningCertificate = hsc;
+            this.codeHasSigningCertificateAsUser = hsca;
+        }
+
+        @Override
+        public String getInterfaceDescriptor() throws RemoteException {
+            return base.getInterfaceDescriptor();
+        }
+
+        @Override
+        public boolean pingBinder() {
+            return base.pingBinder();
+        }
+
+        @Override
+        public boolean isBinderAlive() {
+            return base.isBinderAlive();
+        }
+
+        @Override
+        public IInterface queryLocalInterface(String descriptor) {
+            return base.queryLocalInterface(descriptor);
+        }
+
+        @Override
+        public void dump(FileDescriptor fd, String[] args) throws RemoteException {
+            base.dump(fd, args);
+        }
+
+        @Override
+        public void dumpAsync(FileDescriptor fd, String[] args) throws RemoteException {
+            base.dumpAsync(fd, args);
+        }
+
+        @Override
+        public boolean transact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
+            boolean result = base.transact(code, data, reply, flags);
+            if (reply == null) return result;
+
+            if (code == codeCheckSignatures || code == codeCheckSignaturesAsUser) {
+                if (!replyHasNoException(reply)) return result;
+                reply.setDataPosition(0);
+                reply.setDataSize(0);
+                reply.writeNoException();
+                reply.writeInt(PackageManager.SIGNATURE_MATCH);
+                reply.setDataPosition(0);
+                return result;
+            }
+
+            if (code == codeHasSigningCertificate || code == codeHasSigningCertificateAsUser) {
+                if (!replyHasNoException(reply)) return result;
+                reply.setDataPosition(0);
+                reply.setDataSize(0);
+                reply.writeNoException();
+                reply.writeInt(1);
+                reply.setDataPosition(0);
+                return result;
+            }
+
+            if (code == codeGetPackageInfo
+                    || code == codeGetPackageInfoAsUser
+                    || code == codeGetPackageInfoVersioned
+                    || code == codeGetPackageInfoVersionedAsUser) {
+                patchPackageInfoReplyIfPresent(reply);
+                return result;
+            }
+
+            if (codeGetPackageInfo == -1
+                    || codeGetPackageInfoAsUser == -1
+                    || codeGetPackageInfoVersioned == -1
+                    || codeGetPackageInfoVersionedAsUser == -1) {
+                if (looksLikeIPackageManagerCall(data)) {
+                    patchPackageInfoReplyIfPresent(reply);
+                }
+            }
+
+            return result;
+        }
+
+        @Override
+        public void linkToDeath(DeathRecipient recipient, int flags) throws RemoteException {
+            base.linkToDeath(recipient, flags);
+        }
+
+        @Override
+        public boolean unlinkToDeath(DeathRecipient recipient, int flags) {
+            return base.unlinkToDeath(recipient, flags);
+        }
+
+        private boolean replyHasNoException(Parcel reply) {
+            try {
+                reply.setDataPosition(0);
+                reply.readException();
+                return true;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+
+        private void patchPackageInfoReplyIfPresent(Parcel reply) {
+            try {
+                reply.setDataPosition(0);
+                reply.readException();
+
+                int present = reply.readInt();
+                if (present == 0) {
+                    reply.setDataPosition(0);
+                    return;
+                }
+
+                PackageInfo pi = PackageInfo.CREATOR.createFromParcel(reply);
+                if (pi == null) {
+                    reply.setDataPosition(0);
+                    return;
+                }
+
+                if (!targetPkg.equals(pi.packageName)) {
+                    reply.setDataPosition(0);
+                    return;
+                }
+
+                patchPackageInfoSignatures(pi, fakeSig);
+
+                reply.setDataPosition(0);
+                reply.setDataSize(0);
+                reply.writeNoException();
+                reply.writeInt(1);
+                pi.writeToParcel(reply, 0);
+                reply.setDataPosition(0);
+            } catch (Throwable ignored) {
+                try {
+                    reply.setDataPosition(0);
+                } catch (Throwable ignored2) {
+                }
+            }
+        }
+
+        private boolean looksLikeIPackageManagerCall(Parcel data) {
+            if (data == null) return false;
+            try {
+                int pos = data.dataPosition();
+                data.setDataPosition(0);
+                String token = data.readString();
+                data.setDataPosition(pos);
+                return "android.content.pm.IPackageManager".equals(token);
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+
+        private static int readStaticIntSafely(Class<?> c, String fieldName) {
+            try {
+                Field f = c.getDeclaredField(fieldName);
+                f.setAccessible(true);
+                Object v = f.get(null);
+                if (v instanceof Integer) return (Integer) v;
+            } catch (Throwable ignored) {
+            }
+            return -1;
         }
     }
 
@@ -831,8 +970,41 @@ public class HookApplication extends Application {
 
     /** 清理 PackageManager 缓存（可能被隐藏 API 限制拦截，忽略异常即可） */
     private static void clearPackageManagerInfoCache() {
+        tryClearStaticCache(PackageManager.class, "sPackageInfoCache");
+
         try {
-            Object cache = findField(PackageManager.class, "sPackageInfoCache").get(null);
+            Class<?> apmClz = Class.forName("android.app.ApplicationPackageManager");
+            tryClearStaticCache(apmClz, "sPackageInfoCache");
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Class<?> atClz = Class.forName("android.app.ActivityThread");
+            Method curApp = atClz.getDeclaredMethod("currentApplication");
+            curApp.setAccessible(true);
+            Object app = curApp.invoke(null);
+            if (app instanceof Application) {
+                PackageManager pm = ((Application) app).getPackageManager();
+                tryClearInstanceCache(pm, "mPackageInfoCache");
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void tryClearStaticCache(Class<?> clz, String fieldName) {
+        try {
+            Object cache = findField(clz, fieldName).get(null);
+            if (cache != null) {
+                cache.getClass().getMethod("clear").invoke(cache);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void tryClearInstanceCache(Object instance, String fieldName) {
+        if (instance == null) return;
+        try {
+            Object cache = findField(instance.getClass(), fieldName).get(instance);
             if (cache != null) {
                 cache.getClass().getMethod("clear").invoke(cache);
             }
