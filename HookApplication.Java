@@ -586,20 +586,27 @@ public class HookApplication extends Application {
 
     private static void startStealthSignaturePatcherIfPossible() {
         if (PATCHER_STARTED.get()) return;
-        final Application app = sApp;
         final String targetPkg = sTargetPkg;
         final Signature fakeSig = sFakeSig;
-        if (app == null || targetPkg == null || fakeSig == null) return;
+        if (targetPkg == null || fakeSig == null) return;
         if (!PATCHER_STARTED.compareAndSet(false, true)) return;
 
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                for (int i = 0; i < 40; i++) {
+                for (int i = 0; i < 60; i++) {
                     try {
+                        Application app = sApp;
+                        if (app == null) {
+                            app = resolveCurrentApplication();
+                            if (app != null) sApp = app;
+                        }
+
                         installPmBinderProxyIfPossible(targetPkg, fakeSig);
-                        warmAndPatchPackageInfo(app, targetPkg, fakeSig);
-                        patchPackageInfoCachesNoEvict(targetPkg, fakeSig);
+                        if (app != null) {
+                            warmAndPatchPackageInfo(app, targetPkg, fakeSig);
+                            patchPackageInfoCachesNoEvict(targetPkg, fakeSig);
+                        }
                         try {
                             Thread.sleep(50);
                         } catch (InterruptedException ignored) {
@@ -615,6 +622,18 @@ public class HookApplication extends Application {
         } catch (Throwable ignored) {
         }
         t.start();
+    }
+
+    private static Application resolveCurrentApplication() {
+        try {
+            Class<?> atClz = Class.forName("android.app.ActivityThread");
+            Method m = atClz.getDeclaredMethod("currentApplication");
+            m.setAccessible(true);
+            Object app = m.invoke(null);
+            if (app instanceof Application) return (Application) app;
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private static void warmAndPatchPackageInfo(Context ctx, String targetPkg, Signature fakeSig) {
