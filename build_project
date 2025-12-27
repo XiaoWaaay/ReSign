@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WRAPPER="$ROOT_DIR/gradlew"
+MODULE="app"
+CLEAN=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clean)
+      CLEAN=true
+      ;;
+    --module)
+      shift
+      MODULE="${1:-app}"
+      ;;
+    *)
+      ;;
+  esac
+  shift || true
+done
+
+if [ ! -f "$WRAPPER" ]; then
+  echo "[错误] 未找到 gradlew"
+  exit 1
+fi
+
+if $CLEAN; then
+  bash "$WRAPPER" clean ":$MODULE:assembleRelease" --no-daemon
+else
+  bash "$WRAPPER" ":$MODULE:assembleRelease" --no-daemon
+fi
+
+OUT_DIR="$ROOT_DIR/$MODULE/build/outputs/apk/release"
+if [ ! -d "$OUT_DIR" ]; then
+  echo "[错误] 未找到输出目录: $OUT_DIR"
+  exit 1
+fi
+
+APKS=("$OUT_DIR"/*.apk)
+if [ "${APKS[0]}" = "$OUT_DIR/*.apk" ]; then
+  echo "[错误] 未生成 APK 文件"
+  exit 1
+fi
+
+for apk in "${APKS[@]}"; do
+  echo "生成: $apk"
+done
+
+echo "✅ Release 构建完成"
