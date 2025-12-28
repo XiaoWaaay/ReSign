@@ -9,6 +9,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <stddef.h>   // offsetof
 #include <string.h>   // 仅用于 memset
@@ -45,14 +46,16 @@
 # define SECCOMP_FILTER_FLAG_TSYNC 1
 #endif
 
-#if !defined(SYS_openat) && defined(__NR_openat)
-# define SYS_openat __NR_openat
-#endif
 #if !defined(SYS_readlinkat) && defined(__NR_readlinkat)
 # define SYS_readlinkat __NR_readlinkat
 #endif
+#if !defined(SYS_process_vm_readv) && defined(__NR_process_vm_readv)
+# define SYS_process_vm_readv __NR_process_vm_readv
+#endif
+#if !defined(SYS_process_vm_writev) && defined(__NR_process_vm_writev)
+# define SYS_process_vm_writev __NR_process_vm_writev
+#endif
 
-static constexpr unsigned int kSysOpenat = SYS_openat;
 static constexpr unsigned int kSysReadlinkat = SYS_readlinkat;
 
 // ===== 全局重定向目标 =====
@@ -68,11 +71,8 @@ static const int kMaxReadlinkLen = 4096;
 
 typedef struct {
    int type;
-   int has_dirfd;
-   int dirfd_value;
-   int flags;
-   int mode;
    int buflen;
+   int dirfd;
    int path_len;
    char path[kMaxPathLen];
 } ProxyReq;
@@ -111,6 +111,54 @@ static inline int c_ends_with(const char* s, const char* suf) {
    const char* sp = s + (ls - lu);
    while (*sp && *suf && (*sp == *suf)) { ++sp; ++suf; }
    return (*suf == '\0');
+}
+
+static int safe_read_memory(pid_t pid, const void* remote, void* local, size_t len) {
+#if defined(SYS_process_vm_readv)
+   struct iovec local_iov;
+   local_iov.iov_base = local;
+   local_iov.iov_len = len;
+   struct iovec remote_iov;
+   remote_iov.iov_base = const_cast<void*>(remote);
+   remote_iov.iov_len = len;
+   ssize_t n = syscall(SYS_process_vm_readv, pid, &local_iov, 1, &remote_iov, 1, 0);
+   return (n == (ssize_t)len) ? 0 : -1;
+#else
+   (void)pid;
+   (void)remote;
+   (void)local;
+   (void)len;
+   errno = ENOSYS;
+   return -1;
+#endif
+}
+
+static int safe_write_memory(pid_t pid, void* remote, const void* local, size_t len) {
+#if defined(SYS_process_vm_writev)
+   struct iovec local_iov;
+   local_iov.iov_base = const_cast<void*>(local);
+   local_iov.iov_len = len;
+   struct iovec remote_iov;
+   remote_iov.iov_base = remote;
+   remote_iov.iov_len = len;
+   ssize_t n = syscall(SYS_process_vm_writev, pid, &local_iov, 1, &remote_iov, 1, 0);
+   return (n == (ssize_t)len) ? 0 : -1;
+#else
+   (void)pid;
+   (void)remote;
+   (void)local;
+   (void)len;
+   errno = ENOSYS;
+   return -1;
+#endif
+}
+
+static int safe_read_cstring(pid_t pid, const char* remote, char* out, size_t out_cap) {
+   if (!remote || !out || out_cap == 0) return -1;
+   memset(out, 0, out_cap);
+   if (safe_read_memory(pid, remote, out, out_cap - 1) != 0) return -1;
+   out[out_cap - 1] = '\0';
+   return 0;
 }
 static int send_msg_with_optional_fd(int sock, const void* buf, size_t len, int fd_to_send) {
    struct msghdr msg;
@@ -171,30 +219,13 @@ static int recv_msg_with_optional_fd(int sock, void* buf, size_t len, int* out_f
 static void proxy_loop(int sock) {
    for (;;) {
        ProxyReq req;
-       int recv_fd = -1;
-       if (recv_msg_with_optional_fd(sock, &req, sizeof(req), &recv_fd) != 0) continue;
+       if (recv_msg_with_optional_fd(sock, &req, sizeof(req), nullptr) != 0) continue;
 
        ProxyResp resp;
        memset(&resp, 0, sizeof(resp));
 
-       if (req.type == kSysOpenat) {
-           int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
-           long ret = syscall(kSysOpenat, dirfd, req.path, req.flags, req.mode);
-           if (ret == -1) {
-               resp.ret = -errno;
-               (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
-           } else {
-               int opened_fd = (int)ret;
-               resp.ret = 0;
-               (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), opened_fd);
-               close(opened_fd);
-           }
-           if (recv_fd >= 0) close(recv_fd);
-           continue;
-       }
-
        if (req.type == kSysReadlinkat) {
-           int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
+           int dirfd = req.dirfd;
            int buflen = req.buflen;
            if (buflen < 0) buflen = 0;
            if (buflen > kMaxReadlinkLen) buflen = kMaxReadlinkLen;
@@ -209,13 +240,11 @@ static void proxy_loop(int sock) {
                if (resp.data_len > kMaxReadlinkLen) resp.data_len = kMaxReadlinkLen;
            }
            (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
-           if (recv_fd >= 0) close(recv_fd);
            continue;
        }
 
        resp.ret = -ENOSYS;
        (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
-       if (recv_fd >= 0) close(recv_fd);
    }
 }
 
@@ -242,18 +271,13 @@ static int start_proxy_process() {
    return 0;
 }
 
-static int install_seccomp_filter_all_threads() {
-   // 只拦 openat(56) 与 readlinkat(78)
+static int install_seccomp_filter_readlinkat_all_threads() {
    struct sock_filter filter[] = {
            // A = seccomp_data.nr
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-           // if (A == 56) -> TRAP
-           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 0, 3),
-           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-           // if (A == 78) -> TRAP
+           // if (A == readlinkat) -> TRAP
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 0, 1),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-           // 其他全部允许
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
    };
    struct sock_fprog prog;
@@ -333,123 +357,75 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
    return;
 #endif
 
-   if (nr != kSysOpenat && nr != kSysReadlinkat) return;
-
-   LOGI("[*] SVC call %ld", nr);
-
-   // --- openat(56)：如果 pathname 含 ".apk" 则改为 g_rep_path ---
-   if (nr == kSysOpenat) {
-       const char* pathname = (const char*)a1;
-       LOGI("[*] open%s",pathname);
-       if (pathname && g_apk_path && g_rep_path && c_ends_with(pathname, g_apk_path)) {
-           LOGI("重定向到原apk：%s-->>%s",pathname,g_rep_path);
-           a1 = (long)g_rep_path; // 替换路径
-       }
-       // 如果需要严格处理 O_CREAT 模式，可在此判断 a2 & O_CREAT 决定 a3 的有效性
-   }
-
-   // --- readlinkat(78)：如果要“伪造读到 apkPath”，直接在 handler 中写 buf 并返回长度；否则转发 ---
-   if (nr == kSysReadlinkat) {
-       const char* pathname = (const char*)a1;
-       char* buf = (char*)a2;
-       long buflen = a3;
-       LOGI("[*] readlinkat origin %s",pathname);
-       if (pathname && buf && g_apk_path && c_has_sub(pathname, "origin.apk")) {
-           // 伪造 readlinkat 结果：把 g_apk_path 拷到 buf，返回长度
-           long n = c_strlen(g_apk_path);
-           if (n >= buflen) n = buflen - 1;
-           for (long i = 0; i < n; ++i) buf[i] = g_apk_path[i];
-           if (buflen > 0) buf[n] = '\0';
-           SET_RET(n);
-           return;
-       }
-   }
+   if (nr != (long)kSysReadlinkat) return;
 
    if (g_proxy_sock < 0) {
        SET_RET(-ENOSYS);
        return;
    }
 
-   if (nr == kSysOpenat) {
-       ProxyReq req;
-       memset(&req, 0, sizeof(req));
-       req.type = kSysOpenat;
-       req.flags = (int)a2;
-       req.mode = (int)a3;
-       int dirfd = (int)a0;
-       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
-       req.dirfd_value = dirfd;
-
-       const char* p = (const char*)a1;
-       if (!p) {
-           SET_RET(-EFAULT);
-           return;
-       }
-
-       int i = 0;
-       for (; i < kMaxPathLen - 1 && p[i]; ++i) req.path[i] = p[i];
-       req.path[i] = '\0';
-       req.path_len = i;
-
-       int send_fd = req.has_dirfd ? dirfd : -1;
-       if (send_msg_with_optional_fd(g_proxy_sock, &req, sizeof(req), send_fd) != 0) {
-           SET_RET(-EIO);
-           return;
-       }
-
-       ProxyResp resp;
-       int recv_fd = -1;
-       if (recv_msg_with_optional_fd(g_proxy_sock, &resp, sizeof(resp), &recv_fd) != 0) {
-           SET_RET(-EIO);
-           return;
-       }
-
-       SET_RET((recv_fd >= 0) ? recv_fd : resp.ret);
-       return;
-   }
-
-   if (nr == kSysReadlinkat) {
+   if (nr == (long)kSysReadlinkat) {
        ProxyReq req;
        memset(&req, 0, sizeof(req));
        req.type = kSysReadlinkat;
-       int dirfd = (int)a0;
-       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
-       req.dirfd_value = dirfd;
+       req.dirfd = (int)a0;
        req.buflen = (int)a3;
 
        const char* p = (const char*)a1;
-       char* out_buf = (char*)a2;
+       void* out_buf = (void*)a2;
        if (!p || !out_buf) {
            SET_RET(-EFAULT);
            return;
        }
 
-       int i = 0;
-       for (; i < kMaxPathLen - 1 && p[i]; ++i) req.path[i] = p[i];
-       req.path[i] = '\0';
-       req.path_len = i;
+       pid_t self = getpid();
+       if (safe_read_cstring(self, p, req.path, sizeof(req.path)) != 0) {
+           SET_RET(-EFAULT);
+           return;
+       }
+       req.path_len = (int)c_strlen(req.path);
 
-       int send_fd = req.has_dirfd ? dirfd : -1;
-       if (send_msg_with_optional_fd(g_proxy_sock, &req, sizeof(req), send_fd) != 0) {
+       if (g_apk_path && c_has_sub(req.path, "origin.apk")) {
+           long buflen = a3;
+           long n = c_strlen(g_apk_path);
+           if (buflen <= 0) {
+               SET_RET(-EINVAL);
+               return;
+           }
+           if (n >= buflen) n = buflen - 1;
+           if (n < 0) n = 0;
+           if (safe_write_memory(self, out_buf, g_apk_path, (size_t)n) != 0) {
+               SET_RET(-EFAULT);
+               return;
+           }
+           char z = '\0';
+           (void)safe_write_memory(self, (char*)out_buf + n, &z, 1);
+           SET_RET(n);
+           return;
+       }
+
+       if (send_msg_with_optional_fd(g_proxy_sock, &req, sizeof(req), -1) != 0) {
            SET_RET(-EIO);
            return;
        }
 
        ProxyResp resp;
-       int recv_fd = -1;
-       if (recv_msg_with_optional_fd(g_proxy_sock, &resp, sizeof(resp), &recv_fd) != 0) {
-           if (recv_fd >= 0) close(recv_fd);
+       if (recv_msg_with_optional_fd(g_proxy_sock, &resp, sizeof(resp), nullptr) != 0) {
            SET_RET(-EIO);
            return;
        }
-       if (recv_fd >= 0) close(recv_fd);
 
        if (resp.ret > 0 && resp.data_len > 0) {
            int n = resp.data_len;
            long buflen = a3;
            if (buflen < 0) buflen = 0;
            if (n > (int)buflen) n = (int)buflen;
-           for (int j = 0; j < n; ++j) out_buf[j] = resp.data[j];
+           if (n > 0) {
+               if (safe_write_memory(self, out_buf, resp.data, (size_t)n) != 0) {
+                   SET_RET(-EFAULT);
+                   return;
+               }
+           }
        }
        SET_RET(resp.ret);
        return;
@@ -495,8 +471,8 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
        LOGE("install_sigsys failed");
    }
 
-   if (install_seccomp_filter_all_threads() != 0) {
-       LOGE("install_seccomp_filter_all_threads failed");
+   if (install_seccomp_filter_readlinkat_all_threads() != 0) {
+       LOGE("install_seccomp_filter_readlinkat_all_threads failed");
    }
 
    env->ReleaseStringUTFChars(jSourcePath, src);
