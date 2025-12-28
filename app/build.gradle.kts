@@ -72,6 +72,54 @@ android {
 
 }
 
+val syncKillsigntureSoToAssetsDebug = tasks.register("syncKillsigntureSoToAssetsDebug") {
+    val abi = "arm64-v8a"
+    val destFile = layout.projectDirectory.file("src/main/assets/libkillsignture.so").asFile
+    val builtSoTree = fileTree(layout.buildDirectory.dir("intermediates/cxx/Debug")) {
+        include("**/obj/$abi/libkillsignture.so")
+    }
+
+    dependsOn("externalNativeBuildDebug")
+    inputs.files(builtSoTree)
+    outputs.file(destFile)
+
+    doLast {
+        val builtSo = builtSoTree.files.firstOrNull() ?: throw GradleException(
+            "libkillsignture.so not found under build/intermediates/cxx/Debug for abi=$abi"
+        )
+        destFile.parentFile.mkdirs()
+        builtSo.copyTo(destFile, overwrite = true)
+    }
+}
+
+val syncKillsigntureSoToAssetsRelease = tasks.register("syncKillsigntureSoToAssetsRelease") {
+    val abi = "arm64-v8a"
+    val destFile = layout.projectDirectory.file("src/main/assets/libkillsignture.so").asFile
+    val builtSoTree = fileTree(layout.buildDirectory.dir("intermediates/cxx/Release")) {
+        include("**/obj/$abi/libkillsignture.so")
+    }
+
+    dependsOn("externalNativeBuildRelease")
+    inputs.files(builtSoTree)
+    outputs.file(destFile)
+
+    doLast {
+        val builtSo = builtSoTree.files.firstOrNull() ?: throw GradleException(
+            "libkillsignture.so not found under build/intermediates/cxx/Release for abi=$abi"
+        )
+        destFile.parentFile.mkdirs()
+        builtSo.copyTo(destFile, overwrite = true)
+    }
+}
+
+tasks.matching { it.name == "mergeDebugAssets" }.configureEach {
+    dependsOn(syncKillsigntureSoToAssetsDebug)
+}
+
+tasks.matching { it.name == "mergeReleaseAssets" }.configureEach {
+    dependsOn(syncKillsigntureSoToAssetsRelease)
+}
+
 dependencies {
 
     implementation("androidx.core:core-ktx:1.10.1")
@@ -120,4 +168,3 @@ dependencies {
 
 
 }
-

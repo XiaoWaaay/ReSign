@@ -1,16 +1,23 @@
 // resig_native.cpp  (编译成 libkillsignture.so)
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include <jni.h>
 #include <android/log.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
 #include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <pthread.h>
 #include <ucontext.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
-#include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/uio.h>
-#include <poll.h>
 #include <fcntl.h>
 #include <stddef.h>   // offsetof
 #include <string.h>   // 仅用于 memset
@@ -47,57 +54,37 @@
 # define SECCOMP_FILTER_FLAG_TSYNC 1
 #endif
 
-#if !defined(SYS_readlinkat) && defined(__NR_readlinkat)
-# define SYS_readlinkat __NR_readlinkat
-#endif
 #if !defined(SYS_openat) && defined(__NR_openat)
 # define SYS_openat __NR_openat
 #endif
-#if !defined(SYS_sendmsg) && defined(__NR_sendmsg)
-# define SYS_sendmsg __NR_sendmsg
+#if !defined(SYS_readlinkat) && defined(__NR_readlinkat)
+# define SYS_readlinkat __NR_readlinkat
 #endif
-#if !defined(SYS_recvmsg) && defined(__NR_recvmsg)
-# define SYS_recvmsg __NR_recvmsg
-#endif
-#if !defined(SYS_process_vm_readv) && defined(__NR_process_vm_readv)
-# define SYS_process_vm_readv __NR_process_vm_readv
-#endif
-#if !defined(SYS_process_vm_writev) && defined(__NR_process_vm_writev)
-# define SYS_process_vm_writev __NR_process_vm_writev
+#if !defined(SYS_write) && defined(__NR_write)
+# define SYS_write __NR_write
 #endif
 
-static constexpr unsigned int kSysReadlinkat = SYS_readlinkat;
 static constexpr unsigned int kSysOpenat = SYS_openat;
+static constexpr unsigned int kSysReadlinkat = SYS_readlinkat;
+static constexpr unsigned int kSysWrite = SYS_write;
 
 // ===== 全局重定向目标 =====
 static const char* g_apk_path = nullptr;  // 原始 APK
 static const char* g_rep_path = nullptr;  // 替换 APK
 
-static constexpr int kProxyChannels = 64;
-static int g_proxy_socks[kProxyChannels];
-static volatile int g_proxy_sock_next = 0;
-static __thread int g_tls_proxy_sock = -1;
-static pid_t g_proxy_pid = -1;
+static uintptr_t g_self_map_start = 0;
+static uintptr_t g_self_map_end_inclusive = 0;
 
-static const int kMaxPathLen = 4096;
-static const int kMaxReadlinkLen = 4096;
+static __thread int g_in_sigsys_handler = 0;
 
-typedef struct {
-   int type;
-   int has_dirfd;
-   int dirfd_value;
-   int flags;
-   int mode;
-   int buflen;
-   int path_len;
-   char path[kMaxPathLen];
-} ProxyReq;
+static const int kMaxTrackedFd = 8192;
+static unsigned char g_redirected_fds[kMaxTrackedFd];
 
-typedef struct {
-   long ret;
-   int data_len;
-   char data[kMaxReadlinkLen];
-} ProxyResp;
+static int g_dbg_pipe_w = -1;
+static int g_dbg_pipe_r = -1;
+static int g_dbg_started = 0;
+static int g_dbg_enabled = 1;
+static pthread_t g_dbg_thread;
 
 // ===== 简单 async-signal-safe 字符串工具 =====
 static inline int c_has_sub(const char* s, const char* sub) {
@@ -129,240 +116,389 @@ static inline int c_ends_with(const char* s, const char* suf) {
    return (*suf == '\0');
 }
 
-static int safe_read_memory(pid_t pid, const void* remote, void* local, size_t len) {
-#if defined(SYS_process_vm_readv)
-   struct iovec local_iov;
-   local_iov.iov_base = local;
-   local_iov.iov_len = len;
-   struct iovec remote_iov;
-   remote_iov.iov_base = const_cast<void*>(remote);
-   remote_iov.iov_len = len;
-   ssize_t n = syscall(SYS_process_vm_readv, pid, &local_iov, 1, &remote_iov, 1, 0);
-   return (n == (ssize_t)len) ? 0 : -1;
-#else
-   (void)pid;
-   (void)remote;
-   (void)local;
-   (void)len;
-   errno = ENOSYS;
-   return -1;
-#endif
+static inline int c_is_digit(char c) {
+   return (c >= '0' && c <= '9');
 }
 
-static int safe_write_memory(pid_t pid, void* remote, const void* local, size_t len) {
-#if defined(SYS_process_vm_writev)
-   struct iovec local_iov;
-   local_iov.iov_base = const_cast<void*>(local);
-   local_iov.iov_len = len;
-   struct iovec remote_iov;
-   remote_iov.iov_base = remote;
-   remote_iov.iov_len = len;
-   ssize_t n = syscall(SYS_process_vm_writev, pid, &local_iov, 1, &remote_iov, 1, 0);
-   return (n == (ssize_t)len) ? 0 : -1;
-#else
-   (void)pid;
-   (void)remote;
-   (void)local;
-   (void)len;
-   errno = ENOSYS;
-   return -1;
-#endif
-}
-
-static int safe_read_cstring(pid_t pid, const char* remote, char* out, size_t out_cap) {
-   if (!remote || !out || out_cap == 0) return -1;
-   memset(out, 0, out_cap);
-   if (safe_read_memory(pid, remote, out, out_cap - 1) != 0) return -1;
-   out[out_cap - 1] = '\0';
-   return 0;
-}
-static int send_msg_with_optional_fd(int sock, const void* buf, size_t len, int fd_to_send) {
-   struct msghdr msg;
-   memset(&msg, 0, sizeof(msg));
-
-   struct iovec iov;
-   iov.iov_base = (void*)buf;
-   iov.iov_len = len;
-   msg.msg_iov = &iov;
-   msg.msg_iovlen = 1;
-
-   char cmsg_buf[CMSG_SPACE(sizeof(int))];
-   if (fd_to_send >= 0) {
-       msg.msg_control = cmsg_buf;
-       msg.msg_controllen = sizeof(cmsg_buf);
-       struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-       cmsg->cmsg_level = SOL_SOCKET;
-       cmsg->cmsg_type = SCM_RIGHTS;
-       cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-       *((int*)CMSG_DATA(cmsg)) = fd_to_send;
+static inline int c_parse_int(const char* s, int* out) {
+   if (!s || !out) return -1;
+   int v = 0;
+   int any = 0;
+   for (const char* p = s; *p; ++p) {
+       if (!c_is_digit(*p)) break;
+       any = 1;
+       int d = (*p - '0');
+       if (v > (2147483647 - d) / 10) return -1;
+       v = v * 10 + d;
    }
-
-   ssize_t n = syscall(SYS_sendmsg, sock, &msg, MSG_NOSIGNAL);
-   return (n == (ssize_t)len) ? 0 : -1;
-}
-
-static int recv_msg_with_optional_fd(int sock, void* buf, size_t len, int* out_fd) {
-   if (out_fd) *out_fd = -1;
-
-   struct msghdr msg;
-   memset(&msg, 0, sizeof(msg));
-
-   struct iovec iov;
-   iov.iov_base = buf;
-   iov.iov_len = len;
-   msg.msg_iov = &iov;
-   msg.msg_iovlen = 1;
-
-   char cmsg_buf[CMSG_SPACE(sizeof(int))];
-   msg.msg_control = cmsg_buf;
-   msg.msg_controllen = sizeof(cmsg_buf);
-
-   ssize_t n = syscall(SYS_recvmsg, sock, &msg, 0);
-   if (n != (ssize_t)len) return -1;
-
-   for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg != nullptr;
-        cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-       if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-           if (out_fd) *out_fd = *((int*)CMSG_DATA(cmsg));
-           break;
-       }
-   }
-
+   if (!any) return -1;
+   *out = v;
    return 0;
 }
 
-static int get_thread_proxy_sock() {
-   if (g_tls_proxy_sock >= 0) return g_tls_proxy_sock;
-
-   int idx = __sync_fetch_and_add(&g_proxy_sock_next, 1);
-   if (idx < 0) idx = 0;
-   if (idx >= kProxyChannels) idx = kProxyChannels - 1;
-   g_tls_proxy_sock = g_proxy_socks[idx];
-   return g_tls_proxy_sock;
+static inline int c_has_prefix(const char* s, const char* pre) {
+   if (!s || !pre) return 0;
+   for (; *pre; ++pre, ++s) {
+       if (*s != *pre) return 0;
+   }
+   return 1;
 }
 
-static int proxy_handle_one(int sock) {
-   ProxyReq req;
-   int recv_fd = -1;
-   if (recv_msg_with_optional_fd(sock, &req, sizeof(req), &recv_fd) != 0) return -1;
+static inline int c_min_i(int a, int b) {
+   return (a < b) ? a : b;
+}
 
-   ProxyResp resp;
-   memset(&resp, 0, sizeof(resp));
-
-   if (req.type == (int)kSysOpenat) {
-       int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
-       long ret = syscall(kSysOpenat, dirfd, req.path, req.flags, req.mode);
-       if (ret == -1) {
-           resp.ret = -errno;
-           (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
-       } else {
-           int opened_fd = (int)ret;
-           resp.ret = 0;
-           (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), opened_fd);
-           close(opened_fd);
-       }
-       if (recv_fd >= 0) close(recv_fd);
+static inline int c_copy_cstr_limited(char* dst, int dst_cap, const char* src, int max_copy) {
+   if (!dst || dst_cap <= 0) return 0;
+   if (!src || max_copy <= 0) {
+       dst[0] = '\0';
        return 0;
    }
-
-   if (req.type == (int)kSysReadlinkat) {
-       int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
-       int buflen = req.buflen;
-       if (buflen < 0) buflen = 0;
-       if (buflen > kMaxReadlinkLen) buflen = kMaxReadlinkLen;
-       long ret = syscall(kSysReadlinkat, dirfd, req.path, resp.data, buflen);
-       if (ret == -1) {
-           resp.ret = -errno;
-           resp.data_len = 0;
-       } else {
-           resp.ret = ret;
-           resp.data_len = (int)ret;
-           if (resp.data_len < 0) resp.data_len = 0;
-           if (resp.data_len > kMaxReadlinkLen) resp.data_len = kMaxReadlinkLen;
-       }
-       (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
-       if (recv_fd >= 0) close(recv_fd);
-       return 0;
+   int n = 0;
+   int limit = c_min_i(dst_cap - 1, max_copy);
+   for (; n < limit; ++n) {
+       char c = src[n];
+       if (c == '\0') break;
+       dst[n] = c;
    }
-
-   resp.ret = -ENOSYS;
-   (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
-   if (recv_fd >= 0) close(recv_fd);
-   return 0;
+   dst[n] = '\0';
+   return n;
 }
 
-static void proxy_loop_multi(int* socks, int count) {
-   struct pollfd pfds[kProxyChannels];
-   for (int i = 0; i < count; ++i) {
-       pfds[i].fd = socks[i];
-       pfds[i].events = POLLIN;
-       pfds[i].revents = 0;
-   }
-
+static void* dbg_thread_main(void*) {
+   char buf[512];
    for (;;) {
-       int n = poll(pfds, count, -1);
-       if (n <= 0) continue;
-       for (int i = 0; i < count; ++i) {
-           if ((pfds[i].revents & POLLIN) == 0) continue;
-           (void)proxy_handle_one(pfds[i].fd);
+       ssize_t n = read(g_dbg_pipe_r, buf, sizeof(buf) - 1);
+       if (n <= 0) {
+           usleep(1000);
+           continue;
        }
+       buf[n] = '\0';
+       LOGI("%s", buf);
+   }
+   return nullptr;
+}
+
+static void start_dbg_logger_once() {
+   if (__atomic_exchange_n(&g_dbg_started, 1, __ATOMIC_ACQ_REL) != 0) return;
+   int fds[2] = {-1, -1};
+#if defined(__linux__)
+   if (pipe2(fds, O_CLOEXEC) != 0) {
+       if (pipe(fds) != 0) {
+           g_dbg_started = 0;
+           return;
+       }
+   }
+#else
+   if (pipe(fds) != 0) {
+       g_dbg_started = 0;
+       return;
+   }
+#endif
+   g_dbg_pipe_r = fds[0];
+   g_dbg_pipe_w = fds[1];
+   pthread_create(&g_dbg_thread, nullptr, dbg_thread_main, nullptr);
+}
+
+static inline void mark_redirected_fd(int fd) {
+   if (fd >= 0 && fd < kMaxTrackedFd) {
+       __atomic_store_n(&g_redirected_fds[fd], (unsigned char)1, __ATOMIC_RELAXED);
    }
 }
 
-static int start_proxy_process() {
-   int sv_parent[kProxyChannels];
-   int sv_child[kProxyChannels];
-   for (int i = 0; i < kProxyChannels; ++i) {
-       g_proxy_socks[i] = -1;
-       sv_parent[i] = -1;
-       sv_child[i] = -1;
+static inline void unmark_redirected_fd(int fd) {
+   if (fd >= 0 && fd < kMaxTrackedFd) {
+       __atomic_store_n(&g_redirected_fds[fd], (unsigned char)0, __ATOMIC_RELAXED);
+   }
+}
+
+static inline int is_redirected_fd(int fd) {
+   if (fd >= 0 && fd < kMaxTrackedFd) {
+       return __atomic_load_n(&g_redirected_fds[fd], __ATOMIC_RELAXED) != 0;
+   }
+   return 0;
+}
+static inline const char* c_basename(const char* path) {
+   if (!path) return path;
+   const char* last = path;
+   for (const char* p = path; *p; ++p) {
+       if (*p == '/') last = p + 1;
+   }
+   return last;
+}
+
+static int find_self_map_range(uintptr_t* out_start, uintptr_t* out_end_inclusive) {
+   if (!out_start || !out_end_inclusive) return -1;
+
+   Dl_info info;
+   memset(&info, 0, sizeof(info));
+   const char* full = nullptr;
+   const char* base = nullptr;
+   void* fbase = nullptr;
+   if (dladdr((void*)&find_self_map_range, &info) != 0 && info.dli_fname) {
+       full = info.dli_fname;
+       base = c_basename(full);
+       fbase = info.dli_fbase;
    }
 
-   for (int i = 0; i < kProxyChannels; ++i) {
-       int sv[2] = {-1, -1};
-       if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) return -1;
-       sv_parent[i] = sv[0];
-       sv_child[i] = sv[1];
-   }
+   struct Ctx {
+       uintptr_t target_base;
+       uintptr_t min_start;
+       uintptr_t max_end;
+       int found;
+   };
 
-   pid_t pid = fork();
-   if (pid < 0) {
-       for (int i = 0; i < kProxyChannels; ++i) {
-           if (sv_parent[i] >= 0) close(sv_parent[i]);
-           if (sv_child[i] >= 0) close(sv_child[i]);
+   Ctx ctx;
+   memset(&ctx, 0, sizeof(ctx));
+   ctx.target_base = (uintptr_t)fbase;
+
+   int (*cb)(struct dl_phdr_info*, size_t, void*) = [](struct dl_phdr_info* i, size_t, void* data) -> int {
+       Ctx* c = (Ctx*)data;
+       if (c->target_base == 0) return 0;
+       if ((uintptr_t)i->dlpi_addr != c->target_base) return 0;
+
+       uintptr_t min_start = 0;
+       uintptr_t max_end = 0;
+       int found = 0;
+       for (int p = 0; p < i->dlpi_phnum; ++p) {
+           const ElfW(Phdr)& ph = i->dlpi_phdr[p];
+           if (ph.p_type != PT_LOAD) continue;
+           uintptr_t start = (uintptr_t)i->dlpi_addr + (uintptr_t)ph.p_vaddr;
+           uintptr_t end = start + (uintptr_t)ph.p_memsz;
+           if (!found) {
+               min_start = start;
+               max_end = end;
+               found = 1;
+           } else {
+               if (start < min_start) min_start = start;
+               if (end > max_end) max_end = end;
+           }
        }
+
+       if (found && max_end > min_start) {
+           c->min_start = min_start;
+           c->max_end = max_end;
+           c->found = 1;
+           return 1;
+       }
+       return 0;
+   };
+
+   (void)dl_iterate_phdr(cb, &ctx);
+   if (ctx.found && ctx.max_end > ctx.min_start) {
+       *out_start = ctx.min_start;
+       *out_end_inclusive = ctx.max_end - 1;
+       return 0;
+   }
+
+   const char* candidates[3] = {nullptr, "libkillsignture.so", "killsignture.so"};
+   candidates[0] = base;
+
+   FILE* fp = fopen("/proc/self/maps", "r");
+   if (!fp) {
+       LOGE("open /proc/self/maps failed: %d", errno);
        return -1;
    }
 
-   if (pid == 0) {
-       for (int i = 0; i < kProxyChannels; ++i) {
-           if (sv_parent[i] >= 0) close(sv_parent[i]);
+   uintptr_t min_start = 0;
+   uintptr_t max_end = 0;
+   int found = 0;
+
+   char line[4096];
+   while (fgets(line, sizeof(line), fp)) {
+       unsigned long long start_ll = 0;
+       unsigned long long end_ll = 0;
+       char perms[8] = {0};
+
+       int n = sscanf(line, "%llx-%llx %7s", &start_ll, &end_ll, perms);
+       if (n < 3) continue;
+
+       uintptr_t start = (uintptr_t)start_ll;
+       uintptr_t end = (uintptr_t)end_ll;
+
+       int matched = 0;
+       for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+           const char* key = candidates[i];
+           if (!key || key[0] == '\0') continue;
+           if (strstr(line, key) != nullptr) {
+               matched = 1;
+               break;
+           }
        }
-       proxy_loop_multi(sv_child, kProxyChannels);
-       _exit(0);
+       if (!matched && full && strstr(line, full) != nullptr) matched = 1;
+       if (!matched) continue;
+
+       if (!found) {
+           min_start = start;
+           max_end = end;
+           found = 1;
+       } else {
+           if (start < min_start) min_start = start;
+           if (end > max_end) max_end = end;
+       }
    }
 
-   for (int i = 0; i < kProxyChannels; ++i) {
-       if (sv_child[i] >= 0) close(sv_child[i]);
-       g_proxy_socks[i] = sv_parent[i];
-   }
-   g_proxy_pid = pid;
+   fclose(fp);
+
+   if (!found || max_end == 0 || max_end <= min_start) return -1;
+   *out_start = min_start;
+   *out_end_inclusive = max_end - 1;
    return 0;
 }
 
-static int install_seccomp_filter_openat_readlinkat_all_threads() {
-   struct sock_filter filter[] = {
-           // A = seccomp_data.nr
+static inline long raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
+#if defined(__aarch64__)
+   register long x8 __asm__("x8") = n;
+   register long x0 __asm__("x0") = a0;
+   register long x1 __asm__("x1") = a1;
+   register long x2 __asm__("x2") = a2;
+   register long x3 __asm__("x3") = a3;
+   register long x4 __asm__("x4") = a4;
+   register long x5 __asm__("x5") = a5;
+   __asm__ volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8) : "memory");
+   return x0;
+#elif defined(__arm__)
+   long ret = 0;
+   __asm__ volatile(
+           "push {r7}\n"
+           "mov r7, %1\n"
+           "mov r0, %2\n"
+           "mov r1, %3\n"
+           "mov r2, %4\n"
+           "mov r3, %5\n"
+           "mov r4, %6\n"
+           "mov r5, %7\n"
+           "svc 0\n"
+           "mov %0, r0\n"
+           "pop {r7}\n"
+           : "=r"(ret)
+           : "r"(n), "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5)
+           : "r0", "r1", "r2", "r3", "r4", "r5", "memory");
+   return ret;
+#elif defined(__x86_64__)
+   register long rax __asm__("rax") = n;
+   register long rdi __asm__("rdi") = a0;
+   register long rsi __asm__("rsi") = a1;
+   register long rdx __asm__("rdx") = a2;
+   register long r10 __asm__("r10") = a3;
+   register long r8 __asm__("r8") = a4;
+   register long r9 __asm__("r9") = a5;
+   __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+   return rax;
+#elif defined(__i386__)
+   register long eax __asm__("eax") = n;
+   register long ebx __asm__("ebx") = a0;
+   register long ecx __asm__("ecx") = a1;
+   register long edx __asm__("edx") = a2;
+   register long esi __asm__("esi") = a3;
+   register long edi __asm__("edi") = a4;
+   register long ebp __asm__("ebp") = a5;
+   __asm__ volatile("int $0x80" : "+r"(eax) : "r"(ebx), "r"(ecx), "r"(edx), "r"(esi), "r"(edi), "r"(ebp) : "memory");
+   return eax;
+#else
+   (void)n;
+   (void)a0;
+   (void)a1;
+   (void)a2;
+   (void)a3;
+   (void)a4;
+   (void)a5;
+   return -ENOSYS;
+#endif
+}
+
+static inline void dbg_write_line_78(const char* pathname) {
+   if (!g_dbg_enabled || g_dbg_pipe_w < 0) return;
+   if (!pathname) return;
+   char msg[320];
+   int p = 0;
+   msg[p++] = '7';
+   msg[p++] = '8';
+   msg[p++] = ':';
+   msg[p++] = ' ';
+   p += c_copy_cstr_limited(msg + p, (int)sizeof(msg) - p, pathname, 260);
+   if (p < (int)sizeof(msg) - 1) msg[p++] = '\n';
+   msg[p] = '\0';
+   (void)raw_syscall6((long)kSysWrite, (long)g_dbg_pipe_w, (long)msg, (long)p, 0, 0, 0);
+}
+
+static inline void dbg_write_line_78_target(const char* target) {
+   if (!g_dbg_enabled || g_dbg_pipe_w < 0) return;
+   if (!target) return;
+   char msg[320];
+   int p = 0;
+   msg[p++] = '7';
+   msg[p++] = '8';
+   msg[p++] = '-';
+   msg[p++] = '>';
+   msg[p++] = ' ';
+   p += c_copy_cstr_limited(msg + p, (int)sizeof(msg) - p, target, 260);
+   if (p < (int)sizeof(msg) - 1) msg[p++] = '\n';
+   msg[p] = '\0';
+   (void)raw_syscall6((long)kSysWrite, (long)g_dbg_pipe_w, (long)msg, (long)p, 0, 0, 0);
+}
+
+static int install_seccomp_filter_all_threads() {
+   if (g_self_map_start == 0 || g_self_map_end_inclusive == 0 || g_self_map_end_inclusive < g_self_map_start) {
+       LOGE("self map range not ready");
+       return -1;
+   }
+
+   const uint64_t start = (uint64_t)g_self_map_start;
+   const uint64_t end = (uint64_t)g_self_map_end_inclusive;
+   const uint32_t start_lo = (uint32_t)(start & 0xffffffffULL);
+   const uint32_t start_hi = (uint32_t)((start >> 32) & 0xffffffffULL);
+   const uint32_t end_lo = (uint32_t)(end & 0xffffffffULL);
+   const uint32_t end_hi = (uint32_t)((end >> 32) & 0xffffffffULL);
+   const uint32_t ip_off = (uint32_t)offsetof(struct seccomp_data, instruction_pointer);
+
+   struct sock_filter filter_same_hi[] = {
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 0, 1),
-           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 0, 1),
-           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 2, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 1, 0),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 4),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, start_hi, 0, 4),
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 0),
+           BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, start_lo, 0, 2),
+           BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, end_lo, 1, 0),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
    };
+
+   struct sock_filter filter_diff_hi[] = {
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 2, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 1, 0),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 4),
+           BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, start_hi, 0, 9),
+           BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, end_hi, 8, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, start_hi, 0, 3),
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 0),
+           BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, start_lo, 0, 5),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, end_hi, 0, 2),
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 0),
+           BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, end_lo, 1, 0),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+   };
+
+   struct sock_filter* filter = nullptr;
+   size_t filter_len = 0;
+   if (start_hi == end_hi) {
+       filter = filter_same_hi;
+       filter_len = sizeof(filter_same_hi) / sizeof(filter_same_hi[0]);
+   } else {
+       filter = filter_diff_hi;
+       filter_len = sizeof(filter_diff_hi) / sizeof(filter_diff_hi[0]);
+   }
+
    struct sock_fprog prog;
-   prog.len    = (unsigned short)(sizeof(filter) / sizeof(filter[0]));
+   prog.len    = (unsigned short)filter_len;
    prog.filter = filter;
 
    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
@@ -438,132 +574,100 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
    return;
 #endif
 
-   if (nr != (long)kSysOpenat && nr != (long)kSysReadlinkat) return;
+   if (nr != kSysOpenat && nr != kSysReadlinkat) return;
 
-   int sock = get_thread_proxy_sock();
-   if (sock < 0) {
+   if (g_in_sigsys_handler != 0) {
        SET_RET(-ENOSYS);
        return;
    }
+   g_in_sigsys_handler = 1;
 
-   pid_t self = getpid();
-
-   if (nr == (long)kSysOpenat) {
-       int dirfd = (int)a0;
-       const char* remote_path = (const char*)a1;
-       if (!remote_path) {
-           SET_RET(-EFAULT);
-           return;
+   // --- openat(56)：如果 pathname 含 ".apk" 则改为 g_rep_path ---
+   if (nr == kSysOpenat) {
+       const char* pathname = (const char*)a1;
+       int did_redirect = 0;
+       if (pathname && g_apk_path && g_rep_path && g_apk_path[0] != '\0' && c_ends_with(pathname, g_apk_path)) {
+           a1 = (long)g_rep_path; // 替换路径
+           did_redirect = 1;
        }
 
-       char local_path[kMaxPathLen];
-       if (safe_read_cstring(self, remote_path, local_path, sizeof(local_path)) != 0) {
-           SET_RET(-EFAULT);
-           return;
+       long ret = raw_syscall6((long)kSysOpenat, a0, a1, a2, a3, 0, 0);
+       if (did_redirect && ret >= 0) {
+           mark_redirected_fd((int)ret);
        }
-
-       const char* use_path = local_path;
-       if (g_apk_path && g_rep_path && c_ends_with(local_path, g_apk_path)) {
-           use_path = g_rep_path;
-       }
-
-       ProxyReq req;
-       memset(&req, 0, sizeof(req));
-       req.type = (int)kSysOpenat;
-       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
-       req.dirfd_value = dirfd;
-       req.flags = (int)a2;
-       req.mode = (int)a3;
-
-       int i = 0;
-       for (; i < kMaxPathLen - 1 && use_path[i]; ++i) req.path[i] = use_path[i];
-       req.path[i] = '\0';
-       req.path_len = i;
-
-       int send_fd = req.has_dirfd ? dirfd : -1;
-       if (send_msg_with_optional_fd(sock, &req, sizeof(req), send_fd) != 0) {
-           SET_RET(-EIO);
-           return;
-       }
-
-       ProxyResp resp;
-       int opened_fd = -1;
-       if (recv_msg_with_optional_fd(sock, &resp, sizeof(resp), &opened_fd) != 0) {
-           SET_RET(-EIO);
-           return;
-       }
-
-       SET_RET((opened_fd >= 0) ? opened_fd : resp.ret);
+       SET_RET(ret);
+       g_in_sigsys_handler = 0;
        return;
    }
 
-   if (nr == (long)kSysReadlinkat) {
-       int dirfd = (int)a0;
-       const char* remote_path = (const char*)a1;
-       void* out_buf = (void*)a2;
+   // --- readlinkat(78)：如果要“伪造读到 apkPath”，直接在 handler 中写 buf 并返回长度；否则转发 ---
+   if (nr == kSysReadlinkat) {
+       const char* pathname = (const char*)a1;
+       char* buf = (char*)a2;
        long buflen = a3;
-       if (!remote_path || !out_buf) {
-           SET_RET(-EFAULT);
-           return;
+
+       dbg_write_line_78(pathname);
+
+       if (pathname && c_has_prefix(pathname, "/proc/self/fd/")) {
+           int fd = -1;
+           if (c_parse_int(pathname + 14, &fd) == 0 && is_redirected_fd(fd) && g_apk_path && g_apk_path[0] != '\0') {
+               char tmp[512];
+               long r = raw_syscall6((long)kSysReadlinkat, a0, a1, (long)tmp, (long)(sizeof(tmp) - 1), 0, 0);
+               if (r > 0 && r < (long)sizeof(tmp)) {
+                   tmp[r] = '\0';
+                   dbg_write_line_78_target(tmp);
+                   int match = 0;
+                   if (g_rep_path && g_rep_path[0] != '\0') {
+                       if (c_has_sub(tmp, g_rep_path)) {
+                           match = 1;
+                       } else {
+                           const char* rep_base = c_basename(g_rep_path);
+                           if (rep_base && rep_base[0] != '\0' && c_has_sub(tmp, rep_base)) {
+                               match = 1;
+                           }
+                       }
+                   }
+                   if (match) {
+                       if (buflen <= 0) {
+                           SET_RET(-EINVAL);
+                       } else {
+                           long n = c_strlen(g_apk_path);
+                           if (n >= buflen) n = buflen - 1;
+                           for (long i = 0; i < n; ++i) buf[i] = g_apk_path[i];
+                           buf[n] = '\0';
+                           SET_RET(n);
+                       }
+                       g_in_sigsys_handler = 0;
+                       return;
+                   }
+               }
+
+               unmark_redirected_fd(fd);
+           }
        }
 
-       ProxyReq req;
-       memset(&req, 0, sizeof(req));
-       req.type = (int)kSysReadlinkat;
-       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
-       req.dirfd_value = dirfd;
-       req.buflen = (int)buflen;
-
-       if (safe_read_cstring(self, remote_path, req.path, sizeof(req.path)) != 0) {
-           SET_RET(-EFAULT);
-           return;
-       }
-       req.path_len = (int)c_strlen(req.path);
-
-       if (g_apk_path && c_has_sub(req.path, "origin.apk")) {
-           long n = c_strlen(g_apk_path);
+       if (pathname && buf && g_apk_path && c_has_sub(pathname, "origin.apk")) {
+           // 伪造 readlinkat 结果：把 g_apk_path 拷到 buf，返回长度
            if (buflen <= 0) {
                SET_RET(-EINVAL);
-               return;
+           } else {
+               long n = c_strlen(g_apk_path);
+               if (n >= buflen) n = buflen - 1;
+               for (long i = 0; i < n; ++i) buf[i] = g_apk_path[i];
+               buf[n] = '\0';
+               SET_RET(n);
            }
-           if (n >= buflen) n = buflen - 1;
-           if (n < 0) n = 0;
-           if (safe_write_memory(self, out_buf, g_apk_path, (size_t)n) != 0) {
-               SET_RET(-EFAULT);
-               return;
-           }
-           char z = '\0';
-           (void)safe_write_memory(self, (char*)out_buf + n, &z, 1);
-           SET_RET(n);
+           g_in_sigsys_handler = 0;
            return;
        }
 
-       int send_fd = req.has_dirfd ? dirfd : -1;
-       if (send_msg_with_optional_fd(sock, &req, sizeof(req), send_fd) != 0) {
-           SET_RET(-EIO);
-           return;
-       }
-
-       ProxyResp resp;
-       if (recv_msg_with_optional_fd(sock, &resp, sizeof(resp), nullptr) != 0) {
-           SET_RET(-EIO);
-           return;
-       }
-
-       if (resp.ret > 0 && resp.data_len > 0) {
-           int n = resp.data_len;
-           if (buflen < 0) buflen = 0;
-           if (n > (int)buflen) n = (int)buflen;
-           if (n > 0) {
-               if (safe_write_memory(self, out_buf, resp.data, (size_t)n) != 0) {
-                   SET_RET(-EFAULT);
-                   return;
-               }
-           }
-       }
-       SET_RET(resp.ret);
+       long ret = raw_syscall6((long)kSysReadlinkat, a0, a1, a2, a3, 0, 0);
+       SET_RET(ret);
+       g_in_sigsys_handler = 0;
        return;
    }
+
+   g_in_sigsys_handler = 0;
 
 #undef SET_RET
 }
@@ -592,12 +696,16 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
    const char* rep = env->GetStringUTFChars(jRepPath, nullptr);
 
    // 保存重定向参数
+   if (g_apk_path) { free((void*)g_apk_path); g_apk_path = nullptr; }
+   if (g_rep_path) { free((void*)g_rep_path); g_rep_path = nullptr; }
    g_apk_path = strdup(src ? src : "");
    g_rep_path = strdup(rep ? rep : "");
    LOGI("hookApkPath: src=%s, rep=%s", g_apk_path, g_rep_path);
 
-   if (start_proxy_process() != 0) {
-       LOGE("start_proxy_process failed");
+   start_dbg_logger_once();
+
+   if (find_self_map_range(&g_self_map_start, &g_self_map_end_inclusive) != 0) {
+       LOGE("find_self_map_range failed");
    }
 
    // 2) 安装 SIGSYS 处理器
@@ -605,8 +713,8 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
        LOGE("install_sigsys failed");
    }
 
-   if (install_seccomp_filter_openat_readlinkat_all_threads() != 0) {
-       LOGE("install_seccomp_filter_openat_readlinkat_all_threads failed");
+   if (install_seccomp_filter_all_threads() != 0) {
+       LOGE("install_seccomp_filter_all_threads failed");
    }
 
    env->ReleaseStringUTFChars(jSourcePath, src);
