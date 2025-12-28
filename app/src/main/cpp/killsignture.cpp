@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <stddef.h>   // offsetof
 #include <string.h>   // 仅用于 memset
@@ -49,6 +50,15 @@
 #if !defined(SYS_readlinkat) && defined(__NR_readlinkat)
 # define SYS_readlinkat __NR_readlinkat
 #endif
+#if !defined(SYS_openat) && defined(__NR_openat)
+# define SYS_openat __NR_openat
+#endif
+#if !defined(SYS_sendmsg) && defined(__NR_sendmsg)
+# define SYS_sendmsg __NR_sendmsg
+#endif
+#if !defined(SYS_recvmsg) && defined(__NR_recvmsg)
+# define SYS_recvmsg __NR_recvmsg
+#endif
 #if !defined(SYS_process_vm_readv) && defined(__NR_process_vm_readv)
 # define SYS_process_vm_readv __NR_process_vm_readv
 #endif
@@ -57,13 +67,16 @@
 #endif
 
 static constexpr unsigned int kSysReadlinkat = SYS_readlinkat;
+static constexpr unsigned int kSysOpenat = SYS_openat;
 
 // ===== 全局重定向目标 =====
 static const char* g_apk_path = nullptr;  // 原始 APK
 static const char* g_rep_path = nullptr;  // 替换 APK
 
-// ===== 代理进程通信 =====
-static int g_proxy_sock = -1;
+static constexpr int kProxyChannels = 64;
+static int g_proxy_socks[kProxyChannels];
+static volatile int g_proxy_sock_next = 0;
+static __thread int g_tls_proxy_sock = -1;
 static pid_t g_proxy_pid = -1;
 
 static const int kMaxPathLen = 4096;
@@ -71,8 +84,11 @@ static const int kMaxReadlinkLen = 4096;
 
 typedef struct {
    int type;
+   int has_dirfd;
+   int dirfd_value;
+   int flags;
+   int mode;
    int buflen;
-   int dirfd;
    int path_len;
    char path[kMaxPathLen];
 } ProxyReq;
@@ -181,7 +197,7 @@ static int send_msg_with_optional_fd(int sock, const void* buf, size_t len, int 
        *((int*)CMSG_DATA(cmsg)) = fd_to_send;
    }
 
-   ssize_t n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+   ssize_t n = syscall(SYS_sendmsg, sock, &msg, MSG_NOSIGNAL);
    return (n == (ssize_t)len) ? 0 : -1;
 }
 
@@ -201,7 +217,7 @@ static int recv_msg_with_optional_fd(int sock, void* buf, size_t len, int* out_f
    msg.msg_control = cmsg_buf;
    msg.msg_controllen = sizeof(cmsg_buf);
 
-   ssize_t n = recvmsg(sock, &msg, 0);
+   ssize_t n = syscall(SYS_recvmsg, sock, &msg, 0);
    if (n != (ssize_t)len) return -1;
 
    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
@@ -216,66 +232,131 @@ static int recv_msg_with_optional_fd(int sock, void* buf, size_t len, int* out_f
    return 0;
 }
 
-static void proxy_loop(int sock) {
-   for (;;) {
-       ProxyReq req;
-       if (recv_msg_with_optional_fd(sock, &req, sizeof(req), nullptr) != 0) continue;
+static int get_thread_proxy_sock() {
+   if (g_tls_proxy_sock >= 0) return g_tls_proxy_sock;
 
-       ProxyResp resp;
-       memset(&resp, 0, sizeof(resp));
+   int idx = __sync_fetch_and_add(&g_proxy_sock_next, 1);
+   if (idx < 0) idx = 0;
+   if (idx >= kProxyChannels) idx = kProxyChannels - 1;
+   g_tls_proxy_sock = g_proxy_socks[idx];
+   return g_tls_proxy_sock;
+}
 
-       if (req.type == kSysReadlinkat) {
-           int dirfd = req.dirfd;
-           int buflen = req.buflen;
-           if (buflen < 0) buflen = 0;
-           if (buflen > kMaxReadlinkLen) buflen = kMaxReadlinkLen;
-           long ret = syscall(kSysReadlinkat, dirfd, req.path, resp.data, buflen);
-           if (ret == -1) {
-               resp.ret = -errno;
-               resp.data_len = 0;
-           } else {
-               resp.ret = ret;
-               resp.data_len = (int)ret;
-               if (resp.data_len < 0) resp.data_len = 0;
-               if (resp.data_len > kMaxReadlinkLen) resp.data_len = kMaxReadlinkLen;
-           }
+static int proxy_handle_one(int sock) {
+   ProxyReq req;
+   int recv_fd = -1;
+   if (recv_msg_with_optional_fd(sock, &req, sizeof(req), &recv_fd) != 0) return -1;
+
+   ProxyResp resp;
+   memset(&resp, 0, sizeof(resp));
+
+   if (req.type == (int)kSysOpenat) {
+       int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
+       long ret = syscall(kSysOpenat, dirfd, req.path, req.flags, req.mode);
+       if (ret == -1) {
+           resp.ret = -errno;
            (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
-           continue;
+       } else {
+           int opened_fd = (int)ret;
+           resp.ret = 0;
+           (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), opened_fd);
+           close(opened_fd);
        }
+       if (recv_fd >= 0) close(recv_fd);
+       return 0;
+   }
 
-       resp.ret = -ENOSYS;
+   if (req.type == (int)kSysReadlinkat) {
+       int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
+       int buflen = req.buflen;
+       if (buflen < 0) buflen = 0;
+       if (buflen > kMaxReadlinkLen) buflen = kMaxReadlinkLen;
+       long ret = syscall(kSysReadlinkat, dirfd, req.path, resp.data, buflen);
+       if (ret == -1) {
+           resp.ret = -errno;
+           resp.data_len = 0;
+       } else {
+           resp.ret = ret;
+           resp.data_len = (int)ret;
+           if (resp.data_len < 0) resp.data_len = 0;
+           if (resp.data_len > kMaxReadlinkLen) resp.data_len = kMaxReadlinkLen;
+       }
        (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
+       if (recv_fd >= 0) close(recv_fd);
+       return 0;
+   }
+
+   resp.ret = -ENOSYS;
+   (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
+   if (recv_fd >= 0) close(recv_fd);
+   return 0;
+}
+
+static void proxy_loop_multi(int* socks, int count) {
+   struct pollfd pfds[kProxyChannels];
+   for (int i = 0; i < count; ++i) {
+       pfds[i].fd = socks[i];
+       pfds[i].events = POLLIN;
+       pfds[i].revents = 0;
+   }
+
+   for (;;) {
+       int n = poll(pfds, count, -1);
+       if (n <= 0) continue;
+       for (int i = 0; i < count; ++i) {
+           if ((pfds[i].revents & POLLIN) == 0) continue;
+           (void)proxy_handle_one(pfds[i].fd);
+       }
    }
 }
 
 static int start_proxy_process() {
-   int sv[2] = {-1, -1};
-   if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) return -1;
+   int sv_parent[kProxyChannels];
+   int sv_child[kProxyChannels];
+   for (int i = 0; i < kProxyChannels; ++i) {
+       g_proxy_socks[i] = -1;
+       sv_parent[i] = -1;
+       sv_child[i] = -1;
+   }
+
+   for (int i = 0; i < kProxyChannels; ++i) {
+       int sv[2] = {-1, -1};
+       if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) return -1;
+       sv_parent[i] = sv[0];
+       sv_child[i] = sv[1];
+   }
 
    pid_t pid = fork();
    if (pid < 0) {
-       close(sv[0]);
-       close(sv[1]);
+       for (int i = 0; i < kProxyChannels; ++i) {
+           if (sv_parent[i] >= 0) close(sv_parent[i]);
+           if (sv_child[i] >= 0) close(sv_child[i]);
+       }
        return -1;
    }
 
    if (pid == 0) {
-       close(sv[0]);
-       proxy_loop(sv[1]);
+       for (int i = 0; i < kProxyChannels; ++i) {
+           if (sv_parent[i] >= 0) close(sv_parent[i]);
+       }
+       proxy_loop_multi(sv_child, kProxyChannels);
        _exit(0);
    }
 
-   close(sv[1]);
-   g_proxy_sock = sv[0];
+   for (int i = 0; i < kProxyChannels; ++i) {
+       if (sv_child[i] >= 0) close(sv_child[i]);
+       g_proxy_socks[i] = sv_parent[i];
+   }
    g_proxy_pid = pid;
    return 0;
 }
 
-static int install_seccomp_filter_readlinkat_all_threads() {
+static int install_seccomp_filter_openat_readlinkat_all_threads() {
    struct sock_filter filter[] = {
            // A = seccomp_data.nr
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-           // if (A == readlinkat) -> TRAP
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 0, 1),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 0, 1),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
@@ -357,36 +438,89 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
    return;
 #endif
 
-   if (nr != (long)kSysReadlinkat) return;
+   if (nr != (long)kSysOpenat && nr != (long)kSysReadlinkat) return;
 
-   if (g_proxy_sock < 0) {
+   int sock = get_thread_proxy_sock();
+   if (sock < 0) {
        SET_RET(-ENOSYS);
        return;
    }
 
-   if (nr == (long)kSysReadlinkat) {
-       ProxyReq req;
-       memset(&req, 0, sizeof(req));
-       req.type = kSysReadlinkat;
-       req.dirfd = (int)a0;
-       req.buflen = (int)a3;
+   pid_t self = getpid();
 
-       const char* p = (const char*)a1;
-       void* out_buf = (void*)a2;
-       if (!p || !out_buf) {
+   if (nr == (long)kSysOpenat) {
+       int dirfd = (int)a0;
+       const char* remote_path = (const char*)a1;
+       if (!remote_path) {
            SET_RET(-EFAULT);
            return;
        }
 
-       pid_t self = getpid();
-       if (safe_read_cstring(self, p, req.path, sizeof(req.path)) != 0) {
+       char local_path[kMaxPathLen];
+       if (safe_read_cstring(self, remote_path, local_path, sizeof(local_path)) != 0) {
+           SET_RET(-EFAULT);
+           return;
+       }
+
+       const char* use_path = local_path;
+       if (g_apk_path && g_rep_path && c_ends_with(local_path, g_apk_path)) {
+           use_path = g_rep_path;
+       }
+
+       ProxyReq req;
+       memset(&req, 0, sizeof(req));
+       req.type = (int)kSysOpenat;
+       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
+       req.dirfd_value = dirfd;
+       req.flags = (int)a2;
+       req.mode = (int)a3;
+
+       int i = 0;
+       for (; i < kMaxPathLen - 1 && use_path[i]; ++i) req.path[i] = use_path[i];
+       req.path[i] = '\0';
+       req.path_len = i;
+
+       int send_fd = req.has_dirfd ? dirfd : -1;
+       if (send_msg_with_optional_fd(sock, &req, sizeof(req), send_fd) != 0) {
+           SET_RET(-EIO);
+           return;
+       }
+
+       ProxyResp resp;
+       int opened_fd = -1;
+       if (recv_msg_with_optional_fd(sock, &resp, sizeof(resp), &opened_fd) != 0) {
+           SET_RET(-EIO);
+           return;
+       }
+
+       SET_RET((opened_fd >= 0) ? opened_fd : resp.ret);
+       return;
+   }
+
+   if (nr == (long)kSysReadlinkat) {
+       int dirfd = (int)a0;
+       const char* remote_path = (const char*)a1;
+       void* out_buf = (void*)a2;
+       long buflen = a3;
+       if (!remote_path || !out_buf) {
+           SET_RET(-EFAULT);
+           return;
+       }
+
+       ProxyReq req;
+       memset(&req, 0, sizeof(req));
+       req.type = (int)kSysReadlinkat;
+       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
+       req.dirfd_value = dirfd;
+       req.buflen = (int)buflen;
+
+       if (safe_read_cstring(self, remote_path, req.path, sizeof(req.path)) != 0) {
            SET_RET(-EFAULT);
            return;
        }
        req.path_len = (int)c_strlen(req.path);
 
        if (g_apk_path && c_has_sub(req.path, "origin.apk")) {
-           long buflen = a3;
            long n = c_strlen(g_apk_path);
            if (buflen <= 0) {
                SET_RET(-EINVAL);
@@ -404,20 +538,20 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
            return;
        }
 
-       if (send_msg_with_optional_fd(g_proxy_sock, &req, sizeof(req), -1) != 0) {
+       int send_fd = req.has_dirfd ? dirfd : -1;
+       if (send_msg_with_optional_fd(sock, &req, sizeof(req), send_fd) != 0) {
            SET_RET(-EIO);
            return;
        }
 
        ProxyResp resp;
-       if (recv_msg_with_optional_fd(g_proxy_sock, &resp, sizeof(resp), nullptr) != 0) {
+       if (recv_msg_with_optional_fd(sock, &resp, sizeof(resp), nullptr) != 0) {
            SET_RET(-EIO);
            return;
        }
 
        if (resp.ret > 0 && resp.data_len > 0) {
            int n = resp.data_len;
-           long buflen = a3;
            if (buflen < 0) buflen = 0;
            if (n > (int)buflen) n = (int)buflen;
            if (n > 0) {
@@ -471,8 +605,8 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
        LOGE("install_sigsys failed");
    }
 
-   if (install_seccomp_filter_readlinkat_all_threads() != 0) {
-       LOGE("install_seccomp_filter_readlinkat_all_threads failed");
+   if (install_seccomp_filter_openat_readlinkat_all_threads() != 0) {
+       LOGE("install_seccomp_filter_openat_readlinkat_all_threads failed");
    }
 
    env->ReleaseStringUTFChars(jSourcePath, src);
