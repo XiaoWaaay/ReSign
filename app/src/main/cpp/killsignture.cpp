@@ -2,16 +2,18 @@
 
 #include <jni.h>
 #include <android/log.h>
-#include <pthread.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <fcntl.h>
 #include <stddef.h>   // offsetof
 #include <string.h>   // 仅用于 memset
 #include <stdlib.h>   // malloc/free/strdup
+#include <errno.h>
 
 // ===== 日志（避免在信号处理器里使用 LOG*）=====
 #define TAG "resig-native"
@@ -36,15 +38,50 @@
 #ifndef SECCOMP_MODE_FILTER
 # define SECCOMP_MODE_FILTER 2
 #endif
+#ifndef SECCOMP_SET_MODE_FILTER
+# define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+# define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
+
+#if !defined(SYS_openat) && defined(__NR_openat)
+# define SYS_openat __NR_openat
+#endif
+#if !defined(SYS_readlinkat) && defined(__NR_readlinkat)
+# define SYS_readlinkat __NR_readlinkat
+#endif
+
+static constexpr unsigned int kSysOpenat = SYS_openat;
+static constexpr unsigned int kSysReadlinkat = SYS_readlinkat;
 
 // ===== 全局重定向目标 =====
 static const char* g_apk_path = nullptr;  // 原始 APK
 static const char* g_rep_path = nullptr;  // 替换 APK
 
-// ===== 工人线程与管道 =====
-static int g_req_pipe[2]  = {-1, -1}; // handler -> worker
-static int g_resp_pipe[2] = {-1, -1}; // worker  -> handler
-static pthread_t g_worker;
+// ===== 代理进程通信 =====
+static int g_proxy_sock = -1;
+static pid_t g_proxy_pid = -1;
+
+static const int kMaxPathLen = 4096;
+static const int kMaxReadlinkLen = 4096;
+
+typedef struct {
+   int type;
+   int has_dirfd;
+   int dirfd_value;
+   int flags;
+   int mode;
+   int buflen;
+   int path_len;
+   char path[kMaxPathLen];
+} ProxyReq;
+
+typedef struct {
+   long ret;
+   int data_len;
+   char data[kMaxReadlinkLen];
+} ProxyResp;
 
 // ===== 简单 async-signal-safe 字符串工具 =====
 static inline int c_has_sub(const char* s, const char* sub) {
@@ -75,46 +112,146 @@ static inline int c_ends_with(const char* s, const char* suf) {
    while (*sp && *suf && (*sp == *suf)) { ++sp; ++suf; }
    return (*suf == '\0');
 }
-// ===== 请求结构 =====
-typedef struct {
-   long nr;
-   long args[6];
-} SysReq;
+static int send_msg_with_optional_fd(int sock, const void* buf, size_t len, int fd_to_send) {
+   struct msghdr msg;
+   memset(&msg, 0, sizeof(msg));
 
-// ===== 工人线程：执行真实 syscall =====
-static void* worker_main(void*) {
-   for (;;) {
-       SysReq req;
-       ssize_t n = read(g_req_pipe[0], &req, sizeof(req));
-       if (n != (ssize_t)sizeof(req)) continue;
+   struct iovec iov;
+   iov.iov_base = (void*)buf;
+   iov.iov_len = len;
+   msg.msg_iov = &iov;
+   msg.msg_iovlen = 1;
 
-       long ret = syscall(req.nr,
-                          req.args[0], req.args[1], req.args[2],
-                          req.args[3], req.args[4], req.args[5]);
-       (void)write(g_resp_pipe[1], &ret, sizeof(ret));
+   char cmsg_buf[CMSG_SPACE(sizeof(int))];
+   if (fd_to_send >= 0) {
+       msg.msg_control = cmsg_buf;
+       msg.msg_controllen = sizeof(cmsg_buf);
+       struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+       cmsg->cmsg_level = SOL_SOCKET;
+       cmsg->cmsg_type = SCM_RIGHTS;
+       cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+       *((int*)CMSG_DATA(cmsg)) = fd_to_send;
    }
-   return nullptr;
-}
-static int start_worker_thread() {
-   if (pipe(g_req_pipe)  != 0) return -1;
-   if (pipe(g_resp_pipe) != 0) return -1;
-   pthread_attr_t attr; pthread_attr_init(&attr);
-   int rc = pthread_create(&g_worker, &attr, worker_main, nullptr);
-   pthread_attr_destroy(&attr);
-   return rc;
+
+   ssize_t n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+   return (n == (ssize_t)len) ? 0 : -1;
 }
 
-// ===== 安装 seccomp（仅当前线程）=====
-static int install_seccomp_filter_for_current_thread() {
+static int recv_msg_with_optional_fd(int sock, void* buf, size_t len, int* out_fd) {
+   if (out_fd) *out_fd = -1;
+
+   struct msghdr msg;
+   memset(&msg, 0, sizeof(msg));
+
+   struct iovec iov;
+   iov.iov_base = buf;
+   iov.iov_len = len;
+   msg.msg_iov = &iov;
+   msg.msg_iovlen = 1;
+
+   char cmsg_buf[CMSG_SPACE(sizeof(int))];
+   msg.msg_control = cmsg_buf;
+   msg.msg_controllen = sizeof(cmsg_buf);
+
+   ssize_t n = recvmsg(sock, &msg, 0);
+   if (n != (ssize_t)len) return -1;
+
+   for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg != nullptr;
+        cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+       if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+           if (out_fd) *out_fd = *((int*)CMSG_DATA(cmsg));
+           break;
+       }
+   }
+
+   return 0;
+}
+
+static void proxy_loop(int sock) {
+   for (;;) {
+       ProxyReq req;
+       int recv_fd = -1;
+       if (recv_msg_with_optional_fd(sock, &req, sizeof(req), &recv_fd) != 0) continue;
+
+       ProxyResp resp;
+       memset(&resp, 0, sizeof(resp));
+
+       if (req.type == kSysOpenat) {
+           int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
+           long ret = syscall(kSysOpenat, dirfd, req.path, req.flags, req.mode);
+           if (ret == -1) {
+               resp.ret = -errno;
+               (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
+           } else {
+               int opened_fd = (int)ret;
+               resp.ret = 0;
+               (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), opened_fd);
+               close(opened_fd);
+           }
+           if (recv_fd >= 0) close(recv_fd);
+           continue;
+       }
+
+       if (req.type == kSysReadlinkat) {
+           int dirfd = req.has_dirfd ? recv_fd : req.dirfd_value;
+           int buflen = req.buflen;
+           if (buflen < 0) buflen = 0;
+           if (buflen > kMaxReadlinkLen) buflen = kMaxReadlinkLen;
+           long ret = syscall(kSysReadlinkat, dirfd, req.path, resp.data, buflen);
+           if (ret == -1) {
+               resp.ret = -errno;
+               resp.data_len = 0;
+           } else {
+               resp.ret = ret;
+               resp.data_len = (int)ret;
+               if (resp.data_len < 0) resp.data_len = 0;
+               if (resp.data_len > kMaxReadlinkLen) resp.data_len = kMaxReadlinkLen;
+           }
+           (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
+           if (recv_fd >= 0) close(recv_fd);
+           continue;
+       }
+
+       resp.ret = -ENOSYS;
+       (void)send_msg_with_optional_fd(sock, &resp, sizeof(resp), -1);
+       if (recv_fd >= 0) close(recv_fd);
+   }
+}
+
+static int start_proxy_process() {
+   int sv[2] = {-1, -1};
+   if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) return -1;
+
+   pid_t pid = fork();
+   if (pid < 0) {
+       close(sv[0]);
+       close(sv[1]);
+       return -1;
+   }
+
+   if (pid == 0) {
+       close(sv[0]);
+       proxy_loop(sv[1]);
+       _exit(0);
+   }
+
+   close(sv[1]);
+   g_proxy_sock = sv[0];
+   g_proxy_pid = pid;
+   return 0;
+}
+
+static int install_seccomp_filter_all_threads() {
    // 只拦 openat(56) 与 readlinkat(78)
    struct sock_filter filter[] = {
            // A = seccomp_data.nr
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
            // if (A == 56) -> TRAP
-           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 56, 0, 3),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 0, 3),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
            // if (A == 78) -> TRAP
-           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 78, 0, 1),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 0, 1),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
            // 其他全部允许
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
@@ -127,11 +264,23 @@ static int install_seccomp_filter_for_current_thread() {
        LOGE("PR_SET_NO_NEW_PRIVS failed");
        return -1;
    }
-   if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
-       LOGE("PR_SET_SECCOMP failed");
+
+#if defined(SYS_seccomp)
+   if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) != 0) {
+       LOGE("seccomp(TSYNC) failed");
        return -1;
    }
-   LOGI("seccomp installed (thread-local)");
+#elif defined(__NR_seccomp)
+   if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) != 0) {
+       LOGE("seccomp(TSYNC) failed");
+       return -1;
+   }
+#else
+   LOGE("seccomp syscall not available");
+   return -1;
+#endif
+
+   LOGI("seccomp installed (tsync)");
    return 0;
 }
 
@@ -140,24 +289,59 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
    if (signo != SIGSYS) return;
    ucontext_t* uc = (ucontext_t*)context;
 
-   // AArch64：x8=nr，x0..x5=args
-   long nr = uc->uc_mcontext.regs[8];
-   long a0 = uc->uc_mcontext.regs[0];
-   long a1 = uc->uc_mcontext.regs[1];
-   long a2 = uc->uc_mcontext.regs[2];
-   long a3 = uc->uc_mcontext.regs[3];
-   long a4 = uc->uc_mcontext.regs[4];
-   long a5 = uc->uc_mcontext.regs[5];
+   long nr = 0;
+   long a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
 
-   if (nr != 56 && nr != 78) return;
+#if defined(__aarch64__)
+   nr = uc->uc_mcontext.regs[8];
+   a0 = uc->uc_mcontext.regs[0];
+   a1 = uc->uc_mcontext.regs[1];
+   a2 = uc->uc_mcontext.regs[2];
+   a3 = uc->uc_mcontext.regs[3];
+   a4 = uc->uc_mcontext.regs[4];
+   a5 = uc->uc_mcontext.regs[5];
+# define SET_RET(v) (uc->uc_mcontext.regs[0] = (v))
+#elif defined(__arm__)
+   nr = uc->uc_mcontext.arm_r7;
+   a0 = uc->uc_mcontext.arm_r0;
+   a1 = uc->uc_mcontext.arm_r1;
+   a2 = uc->uc_mcontext.arm_r2;
+   a3 = uc->uc_mcontext.arm_r3;
+   a4 = uc->uc_mcontext.arm_r4;
+   a5 = uc->uc_mcontext.arm_r5;
+# define SET_RET(v) (uc->uc_mcontext.arm_r0 = (v))
+#elif defined(__x86_64__)
+   nr = uc->uc_mcontext.gregs[REG_RAX];
+   a0 = uc->uc_mcontext.gregs[REG_RDI];
+   a1 = uc->uc_mcontext.gregs[REG_RSI];
+   a2 = uc->uc_mcontext.gregs[REG_RDX];
+   a3 = uc->uc_mcontext.gregs[REG_R10];
+   a4 = uc->uc_mcontext.gregs[REG_R8];
+   a5 = uc->uc_mcontext.gregs[REG_R9];
+# define SET_RET(v) (uc->uc_mcontext.gregs[REG_RAX] = (v))
+#elif defined(__i386__)
+   nr = uc->uc_mcontext.gregs[REG_EAX];
+   a0 = uc->uc_mcontext.gregs[REG_EBX];
+   a1 = uc->uc_mcontext.gregs[REG_ECX];
+   a2 = uc->uc_mcontext.gregs[REG_EDX];
+   a3 = uc->uc_mcontext.gregs[REG_ESI];
+   a4 = uc->uc_mcontext.gregs[REG_EDI];
+   a5 = uc->uc_mcontext.gregs[REG_EBP];
+# define SET_RET(v) (uc->uc_mcontext.gregs[REG_EAX] = (v))
+#else
+# define SET_RET(v) ((void)(v))
+   return;
+#endif
 
-   LOGI("[*] SVC call %d",nr);
+   if (nr != kSysOpenat && nr != kSysReadlinkat) return;
+
+   LOGI("[*] SVC call %ld", nr);
 
    // --- openat(56)：如果 pathname 含 ".apk" 则改为 g_rep_path ---
-   if (nr == 56) {
+   if (nr == kSysOpenat) {
        const char* pathname = (const char*)a1;
        LOGI("[*] open%s",pathname);
-       if (pathname && g_rep_path && c_ends_with(pathname, g_apk_path)) {
+       if (pathname && g_apk_path && g_rep_path && c_ends_with(pathname, g_apk_path)) {
            LOGI("重定向到原apk：%s-->>%s",pathname,g_rep_path);
            a1 = (long)g_rep_path; // 替换路径
        }
@@ -165,10 +349,10 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
    }
 
    // --- readlinkat(78)：如果要“伪造读到 apkPath”，直接在 handler 中写 buf 并返回长度；否则转发 ---
-   if (nr == 78) {
-       const char* pathname = (const char*)a2;
-       char* buf = (char*)a3;
-       long buflen = a4;
+   if (nr == kSysReadlinkat) {
+       const char* pathname = (const char*)a1;
+       char* buf = (char*)a2;
+       long buflen = a3;
        LOGI("[*] readlinkat origin %s",pathname);
        if (pathname && buf && g_apk_path && c_has_sub(pathname, "origin.apk")) {
            // 伪造 readlinkat 结果：把 g_apk_path 拷到 buf，返回长度
@@ -176,23 +360,102 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
            if (n >= buflen) n = buflen - 1;
            for (long i = 0; i < n; ++i) buf[i] = g_apk_path[i];
            if (buflen > 0) buf[n] = '\0';
-           uc->uc_mcontext.regs[0] = n; // 返回长度
+           SET_RET(n);
            return;
        }
    }
 
-   // --- 把（可能已改参的）syscall 请求交给工人线程 ---
-   SysReq req;
-   req.nr      = nr;
-   req.args[0] = a0; req.args[1] = a1; req.args[2] = a2;
-   req.args[3] = a3; req.args[4] = a4; req.args[5] = a5;
+   if (g_proxy_sock < 0) {
+       SET_RET(-ENOSYS);
+       return;
+   }
 
-   (void)write(g_req_pipe[1], &req, sizeof(req));
-   long ret = -1;
-   (void)read(g_resp_pipe[0], &ret, sizeof(ret));
+   if (nr == kSysOpenat) {
+       ProxyReq req;
+       memset(&req, 0, sizeof(req));
+       req.type = kSysOpenat;
+       req.flags = (int)a2;
+       req.mode = (int)a3;
+       int dirfd = (int)a0;
+       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
+       req.dirfd_value = dirfd;
 
-   // 把返回值填回 x0，继续执行
-   uc->uc_mcontext.regs[0] = ret;
+       const char* p = (const char*)a1;
+       if (!p) {
+           SET_RET(-EFAULT);
+           return;
+       }
+
+       int i = 0;
+       for (; i < kMaxPathLen - 1 && p[i]; ++i) req.path[i] = p[i];
+       req.path[i] = '\0';
+       req.path_len = i;
+
+       int send_fd = req.has_dirfd ? dirfd : -1;
+       if (send_msg_with_optional_fd(g_proxy_sock, &req, sizeof(req), send_fd) != 0) {
+           SET_RET(-EIO);
+           return;
+       }
+
+       ProxyResp resp;
+       int recv_fd = -1;
+       if (recv_msg_with_optional_fd(g_proxy_sock, &resp, sizeof(resp), &recv_fd) != 0) {
+           SET_RET(-EIO);
+           return;
+       }
+
+       SET_RET((recv_fd >= 0) ? recv_fd : resp.ret);
+       return;
+   }
+
+   if (nr == kSysReadlinkat) {
+       ProxyReq req;
+       memset(&req, 0, sizeof(req));
+       req.type = kSysReadlinkat;
+       int dirfd = (int)a0;
+       req.has_dirfd = (dirfd >= 0) ? 1 : 0;
+       req.dirfd_value = dirfd;
+       req.buflen = (int)a3;
+
+       const char* p = (const char*)a1;
+       char* out_buf = (char*)a2;
+       if (!p || !out_buf) {
+           SET_RET(-EFAULT);
+           return;
+       }
+
+       int i = 0;
+       for (; i < kMaxPathLen - 1 && p[i]; ++i) req.path[i] = p[i];
+       req.path[i] = '\0';
+       req.path_len = i;
+
+       int send_fd = req.has_dirfd ? dirfd : -1;
+       if (send_msg_with_optional_fd(g_proxy_sock, &req, sizeof(req), send_fd) != 0) {
+           SET_RET(-EIO);
+           return;
+       }
+
+       ProxyResp resp;
+       int recv_fd = -1;
+       if (recv_msg_with_optional_fd(g_proxy_sock, &resp, sizeof(resp), &recv_fd) != 0) {
+           if (recv_fd >= 0) close(recv_fd);
+           SET_RET(-EIO);
+           return;
+       }
+       if (recv_fd >= 0) close(recv_fd);
+
+       if (resp.ret > 0 && resp.data_len > 0) {
+           int n = resp.data_len;
+           long buflen = a3;
+           if (buflen < 0) buflen = 0;
+           if (n > (int)buflen) n = (int)buflen;
+           for (int j = 0; j < n; ++j) out_buf[j] = resp.data[j];
+       }
+       SET_RET(resp.ret);
+       return;
+   }
+
+#undef SET_RET
 }
 
 // ===== 安装 SIGSYS =====
@@ -223,9 +486,8 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
    g_rep_path = strdup(rep ? rep : "");
    LOGI("hookApkPath: src=%s, rep=%s", g_apk_path, g_rep_path);
 
-   // 1) 先起工人线程（保证该线程不受后续 seccomp 影响）
-   if (start_worker_thread() != 0) {
-       LOGE("start_worker_thread failed");
+   if (start_proxy_process() != 0) {
+       LOGE("start_proxy_process failed");
    }
 
    // 2) 安装 SIGSYS 处理器
@@ -233,9 +495,8 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
        LOGE("install_sigsys failed");
    }
 
-   // 3) 仅在**当前线程**安装 seccomp（避免把工人线程也拦住）
-   if (install_seccomp_filter_for_current_thread() != 0) {
-       LOGE("install_seccomp_filter_for_current_thread failed");
+   if (install_seccomp_filter_all_threads() != 0) {
+       LOGE("install_seccomp_filter_all_threads failed");
    }
 
    env->ReleaseStringUTFChars(jSourcePath, src);
