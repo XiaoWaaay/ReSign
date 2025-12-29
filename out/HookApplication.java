@@ -1,424 +1,3 @@
-// package com.xwaaa.hook;
-
-// import android.app.Application;
-// import android.content.Context;
-// import android.content.pm.PackageInfo;
-// import android.content.pm.PackageManager;
-// import android.content.pm.Signature;
-// import android.os.Build;
-// import android.os.Environment;
-// import android.util.Base64;
-// import android.util.Log;
-
-// import java.io.BufferedReader;
-// import java.io.File;
-// import java.io.FileOutputStream;
-// import java.io.FileReader;
-// import java.io.InputStream;
-// import java.io.OutputStream;
-// import java.lang.reflect.Constructor;
-// import java.lang.reflect.Field;
-// import java.lang.reflect.InvocationHandler;
-// import java.lang.reflect.Method;
-// import java.lang.reflect.Proxy;
-// import java.util.concurrent.atomic.AtomicBoolean;
-// import java.util.zip.ZipEntry;
-// import java.util.zip.ZipFile;
-
-// public class HookApplication extends Application {
-//     public static final String TAG = "HookApplication";
-
-//     // 由外部注入
-//     public static String packageName   = "xwaaa.package";
-//     public static String signatureData = "xwaaa resig";
-
-//     // 状态位
-//     private static final AtomicBoolean INIT_ONCE           = new AtomicBoolean(false);
-//     private static final AtomicBoolean PM_PROXY_INSTALLED  = new AtomicBoolean(false);
-//     private static final AtomicBoolean APP_PM_PATCHED      = new AtomicBoolean(false);
-//     private static final AtomicBoolean OPEN_HOOKED         = new AtomicBoolean(false);
-
-//     public static native void hookApkPath(String sourceApkPath, String redirectedApkPath);
-//     public static native void cleanup();
-
-//     // 全局上下文与 PM 相关状态
-//     private static volatile Context sAppContext;
-//     private static volatile Object sGlobalPmProxy;  // 兼容原有命名
-//     private static volatile Object sRawIPM;         // 系统原始 IPackageManager
-//     private static volatile Object sPmProxy;        // 我们的代理 IPackageManager
-//     private static volatile boolean sProxyInstalled = false;
-
-//     // =============== 静态初始化 ===============
-//     static {
-//         Log.d(TAG, "=== HookApplication <clinit> ===");
-//         try {
-//             if (shouldRunInThisProcess() && INIT_ONCE.compareAndSet(false, true)) {
-//                 try {
-//                     installGlobalPmProxy(packageName, signatureData);
-//                 } catch (Throwable t) {
-//                     Log.e(TAG, "installGlobalPmProxy failed: " + t.getMessage(), t);
-//                 }
-//             } else {
-//                 Log.d(TAG, "skip: not main process or already inited");
-//             }
-//         } catch (Throwable e) {
-//             Log.e(TAG, "static init error: " + e.getMessage(), e);
-//         }
-//     }
-
-//     private static boolean shouldRunInThisProcess() {
-//         String current = null;
-//         try {
-//             if (Build.VERSION.SDK_INT >= 28) current = Application.getProcessName();
-//             else {
-//                 BufferedReader br = new BufferedReader(new FileReader("/proc/self/cmdline"));
-//                 String line = br.readLine();
-//                 br.close();
-//                 current = (line != null) ? line.trim() : null;
-//             }
-//         } catch (Throwable ignore) {}
-//         return current == null || current.equals(packageName);
-//     }
-
-//     // =============== IPackageManager 全局代理 ===============
-//     private static void installGlobalPmProxy(final String targetPkg, final String fakeSigBase64) throws Exception {
-//         if (PM_PROXY_INSTALLED.get()) return;
-
-//         final Signature fakeSig = new Signature(Base64.decode(fakeSigBase64, Base64.DEFAULT));
-
-//         Class<?> atClz = Class.forName("android.app.ActivityThread");
-//         Object activityThread = atClz.getMethod("currentActivityThread").invoke(null);
-//         Field fSPM = atClz.getDeclaredField("sPackageManager");
-//         fSPM.setAccessible(true);
-//         final Object rawIPM = fSPM.get(activityThread); // 原始 IPackageManager
-
-//         // 记录原始对象，供切换用
-//         sRawIPM = rawIPM;
-
-//         final Class<?> iPmClz = Class.forName("android.content.pm.IPackageManager");
-
-//         InvocationHandler h = new InvocationHandler() {
-//             @Override
-//             public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-//                 String name = method.getName();
-
-//                 // 特殊：一些框架通过这些方法探测代理对象身份，做“隐身”处理
-//                 if ("getClass".equals(name)) {
-//                     return rawIPM.getClass();
-//                 }
-//                 if ("toString".equals(name)) {
-//                     return rawIPM.toString();
-//                 }
-//                 if ("hashCode".equals(name)) {
-//                     return rawIPM.hashCode();
-//                 }
-//                 if ("equals".equals(name) && args != null && args.length == 1) {
-//                     return rawIPM.equals(args[0]);
-//                 }
-
-//                 // 拦 getPackageInfo / getPackageInfoAsUser，改写签名
-//                 if ("getPackageInfo".equals(name) || "getPackageInfoAsUser".equals(name)) {
-//                     Object out = method.invoke(rawIPM, args);
-//                     if (out instanceof PackageInfo) {
-//                         PackageInfo pi = (PackageInfo) out;
-//                         if (targetPkg.equals(pi.packageName)) {
-//                             // 旧字段：signatures
-//                             try {
-//                                 Field fSigs = PackageInfo.class.getDeclaredField("signatures");
-//                                 fSigs.setAccessible(true);
-//                                 fSigs.set(pi, new Signature[]{ fakeSig });
-//                             } catch (Throwable e) {
-//                                 Log.d(TAG, "替换 signatures 失败: " + e.getMessage());
-//                             }
-
-//                             // 新字段：signingInfo (API 28+)
-//                             if (Build.VERSION.SDK_INT >= 28) {
-//                                 try {
-//                                     Field fSI = PackageInfo.class.getDeclaredField("signingInfo");
-//                                     fSI.setAccessible(true);
-//                                     Object si = fSI.get(pi);
-//                                     if (si != null) {
-//                                         // 构造新的 SigningDetails 并替换 SigningInfo 的 mSigningDetails
-//                                         Class<?> sdClz = Class.forName("android.content.pm.SigningDetails");
-//                                         Constructor<?> c =
-//                                                 sdClz.getDeclaredConstructor(Signature[].class, int.class);
-//                                         c.setAccessible(true);
-//                                         Object details = c.newInstance(new Signature[]{ fakeSig }, 2);
-//                                         Field fDetails = Class.forName("android.content.pm.SigningInfo")
-//                                                 .getDeclaredField("mSigningDetails");
-//                                         fDetails.setAccessible(true);
-//                                         fDetails.set(si, details);
-//                                     }
-//                                 } catch (Throwable e) {
-//                                     Log.d(TAG, "替换 signingInfo 失败: " + e.getMessage());
-//                                 }
-//                             }
-//                         }
-//                     }
-//                     return out;
-//                 }
-
-//                 // 放过签名与证书检测结果（强制放行）
-//                 if ("checkSignatures".equals(name) || "checkSignaturesAsUser".equals(name)) {
-//                     Object result = method.invoke(rawIPM, args);
-//                     if (result instanceof Integer) {
-//                         int originalResult = (Integer) result;
-//                         if (originalResult != PackageManager.SIGNATURE_MATCH) {
-//                             return PackageManager.SIGNATURE_MATCH;
-//                         }
-//                     }
-//                     return result;
-//                 }
-//                 if ("hasSigningCertificate".equals(name) || "hasSigningCertificateAsUser".equals(name)) {
-//                     Object result = method.invoke(rawIPM, args);
-//                     if (result instanceof Boolean) {
-//                         boolean originalResult = (Boolean) result;
-//                         if (!originalResult) {
-//                             return true;
-//                         }
-//                     }
-//                     return result;
-//                 }
-
-//                 // 其他方法直接转发
-//                 return method.invoke(rawIPM, args);
-//             }
-//         };
-
-//         Object proxy = Proxy.newProxyInstance(iPmClz.getClassLoader(), new Class[]{ iPmClz }, h);
-//         fSPM.set(activityThread, proxy);
-
-//         // 记录代理，并标记安装完成
-//         sGlobalPmProxy = proxy;
-//         sPmProxy = proxy;
-//         sProxyInstalled = true;
-//         PM_PROXY_INSTALLED.set(true);
-
-//         Log.d(TAG, "Global IPackageManager proxy installed (stealth mode)");
-
-//         // 验证代理是否正确安装
-//         verifyProxyInstallation(activityThread, fSPM);
-//     }
-
-//     /** 验证代理安装 */
-//     private static void verifyProxyInstallation(Object activityThread, Field fSPM) {
-//         try {
-//             Object currentPm = fSPM.get(activityThread);
-//             Log.d(TAG, "验证代理安装 - 当前 sPackageManager: " + currentPm.getClass().getName());
-
-//             // 测试 getClass() 拦截
-//             Class<?> pmClass = currentPm.getClass();
-//             Log.d(TAG, "验证 getClass() - 返回: " + pmClass.getName());
-//         } catch (Exception e) {
-//             Log.e(TAG, "验证代理安装失败: " + e.getMessage());
-//         }
-//     }
-
-//     // =============== 把应用侧 PackageManager.mPM 指到同一代理 ===============
-//     private static void patchAppPmIfNeeded(Context ctx) {
-//         if (ctx == null || sGlobalPmProxy == null || APP_PM_PATCHED.get()) return;
-//         try {
-//             PackageManager pm = ctx.getPackageManager();
-//             Field fMPM = pm.getClass().getDeclaredField("mPM");
-//             fMPM.setAccessible(true);
-//             fMPM.set(pm, sGlobalPmProxy);
-//             APP_PM_PATCHED.set(true);
-//             Log.d(TAG, "ApplicationPackageManager.mPM patched");
-
-//             // 验证伪装效果
-//             verifyStealthEffect(pm);
-//         } catch (Throwable t) {
-//             Log.e(TAG, "patchAppPmIfNeeded failed: " + t.getMessage(), t);
-//         }
-//     }
-
-//     /** 验证伪装效果 */
-//     private static void verifyStealthEffect(PackageManager pm) {
-//         try {
-//             Field fMPM = pm.getClass().getDeclaredField("mPM");
-//             fMPM.setAccessible(true);
-//             Object currentPm = fMPM.get(pm);
-
-//             String className = currentPm.getClass().getName();
-//             Log.d(TAG, "当前 mPM 实际类名: " + className);
-
-//             // 调用 getClass() 验证伪装
-//             Class<?> reportedClass = currentPm.getClass();
-//             Log.d(TAG, "getClass() 报告类名: " + reportedClass.getName());
-
-//             boolean isStealth = reportedClass.getName().contains("IPackageManager$Stub$Proxy");
-//             Log.d(TAG, "伪装检测结果: " + (isStealth ? "成功" : "失败"));
-
-//         } catch (Exception e) {
-//             Log.e(TAG, "验证伪装效果失败: " + e.getMessage());
-//         }
-//     }
-
-//     /** 将应用侧 PackageManager.mPM 切到“原始”对象（用于过类名/反射检测） */
-//     public static boolean setAppPmToRaw(Context ctx) {
-//         if (ctx == null || sRawIPM == null) return false;
-//         try {
-//             PackageManager pm = ctx.getPackageManager();
-//             Field fMPM = pm.getClass().getDeclaredField("mPM");
-//             fMPM.setAccessible(true);
-//             fMPM.set(pm, sRawIPM);
-//             return true;
-//         } catch (Throwable t) {
-//             Log.e(TAG, "setAppPmToRaw failed: " + t.getMessage(), t);
-//             return false;
-//         }
-//     }
-
-//     /** 将应用侧 PackageManager.mPM 切回“代理”对象（恢复改签名能力） */
-//     public static boolean setAppPmToProxy(Context ctx) {
-//         if (ctx == null || sPmProxy == null) return false;
-//         try {
-//             PackageManager pm = ctx.getPackageManager();
-//             Field fMPM = pm.getClass().getDeclaredField("mPM");
-//             fMPM.setAccessible(true);
-//             fMPM.set(pm, sPmProxy);
-//             return true;
-//         } catch (Throwable t) {
-//             Log.e(TAG, "setAppPmToProxy failed: " + t.getMessage(), t);
-//             return false;
-//         }
-//     }
-
-//     /** 在回调执行期间切到“原始 mPM”，结束后切回“代理 mPM” */
-//     public static void runWithRawPm(Context ctx, Runnable r) {
-//         boolean switched = setAppPmToRaw(ctx);
-//         try { r.run(); } finally {
-//             if (switched) setAppPmToProxy(ctx);
-//         }
-//     }
-
-//     // =============== 公开的 PM Hook 入口 ===============
-//     public static void killPM(final String pkg, String sigBase64) {
-//         Log.d(TAG, "执行 killPM");
-//         try {
-//             installGlobalPmProxy(pkg, sigBase64);
-//         } catch (Throwable t) {
-//             Log.e(TAG, "killPM: installGlobalPmProxy failed: " + t.getMessage(), t);
-//         }
-//         if (sAppContext != null) {
-//             patchAppPmIfNeeded(sAppContext);
-//         } else {
-//             Log.e(TAG, "killPM: sAppContext is null");
-//         }
-//     }
-
-//     // =============== native 层 open/readlinkat 重定向 ===============
-//     public static void killOpen(String pkg) {
-//         if (OPEN_HOOKED.get()) return;
-//         try {
-//             System.loadLibrary("killsignture");
-
-//             String apkPath = findSelfApkPath(pkg);
-//             if (apkPath == null) {
-//                 Log.e(TAG, "未找到自身 base.apk 路径");
-//                 return;
-//             }
-//             File apkFile = new File(apkPath);
-//             File dataDir = ensureDataDir(pkg);
-//             File redirected = new File(dataDir, "origin.apk");
-
-//             try (ZipFile zip = new ZipFile(apkFile)) {
-//                 ZipEntry entry = zip.getEntry("assets/KillSig/origin.apk");
-//                 if (entry == null) {
-//                     Log.e(TAG, "未找到 assets/KillSig/origin.apk");
-//                     return;
-//                 }
-//                 if (!redirected.exists() || redirected.length() != entry.getSize()) {
-//                     try (InputStream is = zip.getInputStream(entry);
-//                          OutputStream os = new FileOutputStream(redirected)) {
-//                         byte[] buf = new byte[64 * 1024];
-//                         int n;
-//                         while ((n = is.read(buf)) != -1) os.write(buf, 0, n);
-//                     }
-//                     Log.d(TAG, "已解压 origin.apk -> " + redirected.getAbsolutePath());
-//                 }
-//             }
-//             hookApkPath(apkFile.getAbsolutePath(), redirected.getAbsolutePath());
-//             OPEN_HOOKED.set(true);
-//             Log.d(TAG, "killOpen: io重定向 完成");
-//         } catch (Throwable t) {
-//             Log.e(TAG, "killOpen failed: " + t.getMessage(), t);
-//         }
-//     }
-
-
-
-//     // =============== 其余辅助方法 ===============
-//     public static String findSelfApkPath(String pkg) {
-//         try (BufferedReader reader = new BufferedReader(new FileReader("/proc/self/maps"))) {
-//             String line;
-//             while ((line = reader.readLine()) != null) {
-//                 int sp = line.lastIndexOf(' ');
-//                 if (sp <= 0) continue;
-//                 String path = line.substring(sp + 1);
-//                 if (isApkPathOf(pkg, path)) return path;
-//             }
-//         } catch (Throwable e) {
-//             Log.e(TAG, "findSelfApkPath 失败: " + e.getMessage());
-//         }
-//         return null;
-//     }
-
-//     public static boolean isApkPathOf(String pkg, String path) {
-//         if (path == null) return false;
-//         path = path.trim();
-//         if (!path.startsWith("/") || !path.endsWith(".apk")) return false;
-//         if (path.contains("/data/app/") && path.endsWith("/base.apk") && path.contains("/" + pkg + "-")) return true;
-//         if (path.contains("/mnt/expand/") && path.endsWith("/base.apk") && path.contains("/" + pkg)) return true;
-//         return false;
-//     }
-
-//     public static File ensureDataDir(String pkg) {
-//         String username = Environment.getExternalStorageDirectory().getName();
-//         File dir;
-//         if (username != null && username.matches("\\d+")) {
-//             dir = new File("/data/user/" + username + "/" + pkg);
-//             if (!dir.canWrite()) dir = new File("/data/data/" + pkg);
-//         } else {
-//             dir = new File("/data/data/" + pkg);
-//         }
-//         if (!dir.exists()) dir.mkdirs();
-//         return dir;
-//     }
-
-//     // =============== 初始化入口 ===============
-//     public static void initSignatureHook() {
-//         try {
-//             Log.d(TAG, "开始初始化签名 Hook...");
-//             Log.d(TAG, "包名: " + packageName);
-//             Log.d(TAG, "签名(Base64): " + signatureData);
-
-//             killPM(packageName, signatureData);
-//             killOpen(packageName);
-
-//             Log.d(TAG, "签名 Hook 初始化完成!");
-//         } catch (Throwable e) {
-//             Log.e(TAG, "初始化失败: " + e.getMessage(), e);
-//         }
-//     }
-
-//     // =============== 生命周期 ===============
-//     @Override protected void attachBaseContext(Context base) {
-//         super.attachBaseContext(base);
-//         sAppContext = base.getApplicationContext();
-//         Log.d(TAG, "attachBaseContext: sAppContext set");
-//         patchAppPmIfNeeded(sAppContext);
-//     }
-
-//     @Override public void onCreate() {
-//         super.onCreate();
-//         if (sAppContext == null) sAppContext = getApplicationContext();
-//         Log.d(TAG, "onCreate: sAppContext checked");
-//         patchAppPmIfNeeded(sAppContext);
-//     }
-// }
-
-
 package com.xwaaa.hook;
 
 import android.app.Application;
@@ -445,6 +24,8 @@ import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
+import java.lang.ref.WeakReference;
+import java.util.Enumeration;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
@@ -642,28 +223,37 @@ public class HookApplication extends Application {
             PackageManager pm = ctx.getPackageManager();
             if (pm == null) return;
 
-            PackageInfo pi = null;
+            warmOnePackageInfo(pm, targetPkg, fakeSig, (long) PackageManager.GET_SIGNATURES);
+            warmOnePackageInfo(pm, targetPkg, fakeSig, (long) PackageManager.GET_SIGNING_CERTIFICATES);
+        } catch (Throwable ignored) {
+        }
+    }
 
+    private static void warmOnePackageInfo(PackageManager pm, String targetPkg, Signature fakeSig, long flagsLong) {
+        if (pm == null || targetPkg == null || fakeSig == null) return;
+
+        PackageInfo pi = null;
+
+        if (Build.VERSION.SDK_INT >= 33) {
             try {
-                pi = pm.getPackageInfo(targetPkg, PackageManager.GET_SIGNATURES);
+                Method m = pm.getClass().getMethod("getPackageInfo", String.class, PackageManager.PackageInfoFlags.class);
+                Method of = PackageManager.PackageInfoFlags.class.getMethod("of", long.class);
+                Object flags = of.invoke(null, flagsLong);
+                Object out = m.invoke(pm, targetPkg, flags);
+                if (out instanceof PackageInfo) pi = (PackageInfo) out;
             } catch (Throwable ignored) {
             }
+        }
 
-            if (pi == null && Build.VERSION.SDK_INT >= 33) {
-                try {
-                    Method m = pm.getClass().getMethod("getPackageInfo", String.class, PackageManager.PackageInfoFlags.class);
-                    Method of = PackageManager.PackageInfoFlags.class.getMethod("of", long.class);
-                    Object flags = of.invoke(null, (long) PackageManager.GET_SIGNATURES);
-                    Object out = m.invoke(pm, targetPkg, flags);
-                    if (out instanceof PackageInfo) pi = (PackageInfo) out;
-                } catch (Throwable ignored) {
-                }
+        if (pi == null) {
+            try {
+                pi = pm.getPackageInfo(targetPkg, (int) flagsLong);
+            } catch (Throwable ignored) {
             }
+        }
 
-            if (pi != null && targetPkg.equals(pi.packageName)) {
-                patchPackageInfoSignatures(pi, fakeSig);
-            }
-        } catch (Throwable ignored) {
+        if (pi != null && targetPkg.equals(pi.packageName)) {
+            patchPackageInfoSignatures(pi, fakeSig);
         }
     }
 
@@ -1196,6 +786,27 @@ public class HookApplication extends Application {
                 fDetailSigs.set(details, new Signature[]{fakeSig});
             } catch (Throwable ignored) {
             }
+
+            try {
+                Field fPast;
+                try {
+                    fPast = details.getClass().getDeclaredField("pastSigningCertificates");
+                } catch (NoSuchFieldException e) {
+                    try {
+                        fPast = details.getClass().getDeclaredField("mPastSigningCertificates");
+                    } catch (NoSuchFieldException e2) {
+                        fPast = null;
+                    }
+                }
+                if (fPast != null) {
+                    fPast.setAccessible(true);
+                    Object v = fPast.get(details);
+                    if (v == null || v.getClass().isArray()) {
+                        fPast.set(details, new Signature[]{fakeSig});
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
         } catch (Throwable ignored) {
         }
     }
@@ -1238,8 +849,34 @@ public class HookApplication extends Application {
                 }
             }
 
+            try {
+                File metaInfDir = new File(dataDir, "META-INF");
+                extractMetaInfFromApk(redirected, metaInfDir);
+            } catch (Throwable t) {
+                Log.e(TAG, "提取 META-INF 失败: " + t.getMessage(), t);
+            }
+
             // 5) 安装 SVC 拦截（把 base.apk 重定向到 /data/data/.../origin.apk）
-            hookApkPath(apkFile.getAbsolutePath(), redirected.getAbsolutePath());
+            String sourcePath;
+            String redirectedPath;
+            try {
+                sourcePath = apkFile.getCanonicalPath();
+            } catch (Throwable ignored) {
+                sourcePath = apkFile.getAbsolutePath();
+            }
+            try {
+                redirectedPath = redirected.getCanonicalPath();
+            } catch (Throwable ignored) {
+                redirectedPath = redirected.getAbsolutePath();
+            }
+
+            try {
+                patchRuntimeApkPath(pkg, sourcePath, redirectedPath);
+            } catch (Throwable t) {
+                Log.e(TAG, "patchRuntimeApkPath 失败: " + t.getMessage(), t);
+            }
+
+            hookApkPath(sourcePath, redirectedPath);
             Log.d(TAG, "killOpen: io重定向 完成");
             return true;
         } catch (Throwable t) {
@@ -1248,20 +885,137 @@ public class HookApplication extends Application {
         }
     }
 
+    private static void patchRuntimeApkPath(String pkg, String baseApkPath, String redirectedApkPath) throws Exception {
+        if (pkg == null || baseApkPath == null || redirectedApkPath == null) return;
+
+        Class<?> atClz = Class.forName("android.app.ActivityThread");
+        Method cur = atClz.getDeclaredMethod("currentActivityThread");
+        cur.setAccessible(true);
+        Object at = cur.invoke(null);
+        if (at == null) return;
+
+        Field fPkgs = atClz.getDeclaredField("mPackages");
+        fPkgs.setAccessible(true);
+        Object pkgs = fPkgs.get(at);
+        if (!(pkgs instanceof Map)) return;
+
+        Object ref = ((Map<?, ?>) pkgs).get(pkg);
+        Object loadedApk = ref;
+        if (ref instanceof WeakReference) {
+            loadedApk = ((WeakReference<?>) ref).get();
+        }
+        if (loadedApk == null) return;
+
+        try {
+            Field fResDir = findField(loadedApk.getClass(), "mResDir");
+            fResDir.set(loadedApk, redirectedApkPath);
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Field fAppDir = findField(loadedApk.getClass(), "mAppDir");
+            fAppDir.set(loadedApk, redirectedApkPath);
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Field fAi = findField(loadedApk.getClass(), "mApplicationInfo");
+            Object ai = fAi.get(loadedApk);
+            if (ai != null) {
+                try {
+                    Field fSourceDir = findField(ai.getClass(), "sourceDir");
+                    fSourceDir.set(ai, baseApkPath);
+                } catch (Throwable ignored) {
+                }
+                try {
+                    Field fPublicSourceDir = findField(ai.getClass(), "publicSourceDir");
+                    fPublicSourceDir.set(ai, baseApkPath);
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void extractMetaInfFromApk(File originApk, File outDir) throws Exception {
+        if (originApk == null || !originApk.exists()) return;
+        if (outDir == null) return;
+        if (!outDir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            outDir.mkdirs();
+        }
+
+        String outBase = outDir.getCanonicalPath();
+
+        try (ZipFile zip = new ZipFile(originApk)) {
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            byte[] buf = new byte[64 * 1024];
+
+            while (entries.hasMoreElements()) {
+                ZipEntry e = entries.nextElement();
+                if (e == null) continue;
+                String name = e.getName();
+                if (name == null) continue;
+                if (!name.startsWith("META-INF/")) continue;
+
+                File out = new File(outDir, name);
+                String outPath = out.getCanonicalPath();
+                if (!outPath.startsWith(outBase + File.separator) && !outPath.equals(outBase)) continue;
+
+                if (e.isDirectory()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    out.mkdirs();
+                    continue;
+                }
+
+                File parent = out.getParentFile();
+                if (parent != null && !parent.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    parent.mkdirs();
+                }
+
+                try (InputStream is = zip.getInputStream(e);
+                     OutputStream os = new FileOutputStream(out)) {
+                    int n;
+                    while ((n = is.read(buf)) != -1) {
+                        os.write(buf, 0, n);
+                    }
+                }
+            }
+        }
+    }
+
     /** 读取 /proc/self/maps 寻找自身 base.apk 路径 */
     private static String findSelfApkPath(String pkg) {
         try (BufferedReader reader = new BufferedReader(new FileReader("/proc/self/maps"))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                int sp = line.lastIndexOf(' ');
-                if (sp <= 0) continue;
-                String path = line.substring(sp + 1);
-                if (isApkPathOf(pkg, path)) {
-                    return path;
-                }
+                String path = extractApkPathFromMapsLine(line);
+                if (path != null && isApkPathOf(pkg, path)) return path;
             }
         } catch (Throwable e) {
             Log.e(TAG, "findSelfApkPath 失败: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private static String extractApkPathFromMapsLine(String line) {
+        if (line == null) return null;
+        line = line.trim();
+        if (line.isEmpty()) return null;
+
+        String[] parts = line.split("\\s+");
+        if (parts.length == 0) return null;
+
+        for (int i = parts.length - 1; i >= 0; i--) {
+            String token = parts[i];
+            if ("(deleted)".equals(token) && i - 1 >= 0) {
+                token = parts[i - 1];
+                i--;
+            }
+            if (token.startsWith("/") && token.endsWith(".apk")) {
+                return token;
+            }
         }
         return null;
     }

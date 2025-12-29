@@ -24,6 +24,8 @@ import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
+import java.lang.ref.WeakReference;
+import java.util.Enumeration;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
@@ -221,28 +223,37 @@ public class HookApplication extends Application {
             PackageManager pm = ctx.getPackageManager();
             if (pm == null) return;
 
-            PackageInfo pi = null;
+            warmOnePackageInfo(pm, targetPkg, fakeSig, (long) PackageManager.GET_SIGNATURES);
+            warmOnePackageInfo(pm, targetPkg, fakeSig, (long) PackageManager.GET_SIGNING_CERTIFICATES);
+        } catch (Throwable ignored) {
+        }
+    }
 
+    private static void warmOnePackageInfo(PackageManager pm, String targetPkg, Signature fakeSig, long flagsLong) {
+        if (pm == null || targetPkg == null || fakeSig == null) return;
+
+        PackageInfo pi = null;
+
+        if (Build.VERSION.SDK_INT >= 33) {
             try {
-                pi = pm.getPackageInfo(targetPkg, PackageManager.GET_SIGNATURES);
+                Method m = pm.getClass().getMethod("getPackageInfo", String.class, PackageManager.PackageInfoFlags.class);
+                Method of = PackageManager.PackageInfoFlags.class.getMethod("of", long.class);
+                Object flags = of.invoke(null, flagsLong);
+                Object out = m.invoke(pm, targetPkg, flags);
+                if (out instanceof PackageInfo) pi = (PackageInfo) out;
             } catch (Throwable ignored) {
             }
+        }
 
-            if (pi == null && Build.VERSION.SDK_INT >= 33) {
-                try {
-                    Method m = pm.getClass().getMethod("getPackageInfo", String.class, PackageManager.PackageInfoFlags.class);
-                    Method of = PackageManager.PackageInfoFlags.class.getMethod("of", long.class);
-                    Object flags = of.invoke(null, (long) PackageManager.GET_SIGNATURES);
-                    Object out = m.invoke(pm, targetPkg, flags);
-                    if (out instanceof PackageInfo) pi = (PackageInfo) out;
-                } catch (Throwable ignored) {
-                }
+        if (pi == null) {
+            try {
+                pi = pm.getPackageInfo(targetPkg, (int) flagsLong);
+            } catch (Throwable ignored) {
             }
+        }
 
-            if (pi != null && targetPkg.equals(pi.packageName)) {
-                patchPackageInfoSignatures(pi, fakeSig);
-            }
-        } catch (Throwable ignored) {
+        if (pi != null && targetPkg.equals(pi.packageName)) {
+            patchPackageInfoSignatures(pi, fakeSig);
         }
     }
 
@@ -775,6 +786,27 @@ public class HookApplication extends Application {
                 fDetailSigs.set(details, new Signature[]{fakeSig});
             } catch (Throwable ignored) {
             }
+
+            try {
+                Field fPast;
+                try {
+                    fPast = details.getClass().getDeclaredField("pastSigningCertificates");
+                } catch (NoSuchFieldException e) {
+                    try {
+                        fPast = details.getClass().getDeclaredField("mPastSigningCertificates");
+                    } catch (NoSuchFieldException e2) {
+                        fPast = null;
+                    }
+                }
+                if (fPast != null) {
+                    fPast.setAccessible(true);
+                    Object v = fPast.get(details);
+                    if (v == null || v.getClass().isArray()) {
+                        fPast.set(details, new Signature[]{fakeSig});
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
         } catch (Throwable ignored) {
         }
     }
@@ -817,8 +849,34 @@ public class HookApplication extends Application {
                 }
             }
 
+            try {
+                File metaInfDir = new File(dataDir, "META-INF");
+                extractMetaInfFromApk(redirected, metaInfDir);
+            } catch (Throwable t) {
+                Log.e(TAG, "提取 META-INF 失败: " + t.getMessage(), t);
+            }
+
             // 5) 安装 SVC 拦截（把 base.apk 重定向到 /data/data/.../origin.apk）
-            hookApkPath(apkFile.getAbsolutePath(), redirected.getAbsolutePath());
+            String sourcePath;
+            String redirectedPath;
+            try {
+                sourcePath = apkFile.getCanonicalPath();
+            } catch (Throwable ignored) {
+                sourcePath = apkFile.getAbsolutePath();
+            }
+            try {
+                redirectedPath = redirected.getCanonicalPath();
+            } catch (Throwable ignored) {
+                redirectedPath = redirected.getAbsolutePath();
+            }
+
+            try {
+                patchRuntimeApkPath(pkg, sourcePath, redirectedPath);
+            } catch (Throwable t) {
+                Log.e(TAG, "patchRuntimeApkPath 失败: " + t.getMessage(), t);
+            }
+
+            hookApkPath(sourcePath, redirectedPath);
             Log.d(TAG, "killOpen: io重定向 完成");
             return true;
         } catch (Throwable t) {
@@ -827,20 +885,137 @@ public class HookApplication extends Application {
         }
     }
 
+    private static void patchRuntimeApkPath(String pkg, String baseApkPath, String redirectedApkPath) throws Exception {
+        if (pkg == null || baseApkPath == null || redirectedApkPath == null) return;
+
+        Class<?> atClz = Class.forName("android.app.ActivityThread");
+        Method cur = atClz.getDeclaredMethod("currentActivityThread");
+        cur.setAccessible(true);
+        Object at = cur.invoke(null);
+        if (at == null) return;
+
+        Field fPkgs = atClz.getDeclaredField("mPackages");
+        fPkgs.setAccessible(true);
+        Object pkgs = fPkgs.get(at);
+        if (!(pkgs instanceof Map)) return;
+
+        Object ref = ((Map<?, ?>) pkgs).get(pkg);
+        Object loadedApk = ref;
+        if (ref instanceof WeakReference) {
+            loadedApk = ((WeakReference<?>) ref).get();
+        }
+        if (loadedApk == null) return;
+
+        try {
+            Field fResDir = findField(loadedApk.getClass(), "mResDir");
+            fResDir.set(loadedApk, redirectedApkPath);
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Field fAppDir = findField(loadedApk.getClass(), "mAppDir");
+            fAppDir.set(loadedApk, redirectedApkPath);
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Field fAi = findField(loadedApk.getClass(), "mApplicationInfo");
+            Object ai = fAi.get(loadedApk);
+            if (ai != null) {
+                try {
+                    Field fSourceDir = findField(ai.getClass(), "sourceDir");
+                    fSourceDir.set(ai, baseApkPath);
+                } catch (Throwable ignored) {
+                }
+                try {
+                    Field fPublicSourceDir = findField(ai.getClass(), "publicSourceDir");
+                    fPublicSourceDir.set(ai, baseApkPath);
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void extractMetaInfFromApk(File originApk, File outDir) throws Exception {
+        if (originApk == null || !originApk.exists()) return;
+        if (outDir == null) return;
+        if (!outDir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            outDir.mkdirs();
+        }
+
+        String outBase = outDir.getCanonicalPath();
+
+        try (ZipFile zip = new ZipFile(originApk)) {
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            byte[] buf = new byte[64 * 1024];
+
+            while (entries.hasMoreElements()) {
+                ZipEntry e = entries.nextElement();
+                if (e == null) continue;
+                String name = e.getName();
+                if (name == null) continue;
+                if (!name.startsWith("META-INF/")) continue;
+
+                File out = new File(outDir, name);
+                String outPath = out.getCanonicalPath();
+                if (!outPath.startsWith(outBase + File.separator) && !outPath.equals(outBase)) continue;
+
+                if (e.isDirectory()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    out.mkdirs();
+                    continue;
+                }
+
+                File parent = out.getParentFile();
+                if (parent != null && !parent.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    parent.mkdirs();
+                }
+
+                try (InputStream is = zip.getInputStream(e);
+                     OutputStream os = new FileOutputStream(out)) {
+                    int n;
+                    while ((n = is.read(buf)) != -1) {
+                        os.write(buf, 0, n);
+                    }
+                }
+            }
+        }
+    }
+
     /** 读取 /proc/self/maps 寻找自身 base.apk 路径 */
     private static String findSelfApkPath(String pkg) {
         try (BufferedReader reader = new BufferedReader(new FileReader("/proc/self/maps"))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                int sp = line.lastIndexOf(' ');
-                if (sp <= 0) continue;
-                String path = line.substring(sp + 1);
-                if (isApkPathOf(pkg, path)) {
-                    return path;
-                }
+                String path = extractApkPathFromMapsLine(line);
+                if (path != null && isApkPathOf(pkg, path)) return path;
             }
         } catch (Throwable e) {
             Log.e(TAG, "findSelfApkPath 失败: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private static String extractApkPathFromMapsLine(String line) {
+        if (line == null) return null;
+        line = line.trim();
+        if (line.isEmpty()) return null;
+
+        String[] parts = line.split("\\s+");
+        if (parts.length == 0) return null;
+
+        for (int i = parts.length - 1; i >= 0; i--) {
+            String token = parts[i];
+            if ("(deleted)".equals(token) && i - 1 >= 0) {
+                token = parts[i - 1];
+                i--;
+            }
+            if (token.startsWith("/") && token.endsWith(".apk")) {
+                return token;
+            }
         }
         return null;
     }

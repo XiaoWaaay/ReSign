@@ -23,6 +23,7 @@
 #include <string.h>   // 仅用于 memset
 #include <stdlib.h>   // malloc/free/strdup
 #include <errno.h>
+#include <sys/uio.h>
 
 // ===== 日志（避免在信号处理器里使用 LOG*）=====
 #define TAG "resig-native"
@@ -67,6 +68,17 @@
 static constexpr unsigned int kSysOpenat = SYS_openat;
 static constexpr unsigned int kSysReadlinkat = SYS_readlinkat;
 static constexpr unsigned int kSysWrite = SYS_write;
+
+static inline long raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5);
+
+#if !defined(SYS_process_vm_readv) && defined(__NR_process_vm_readv)
+# define SYS_process_vm_readv __NR_process_vm_readv
+#endif
+#if !defined(SYS_process_vm_writev) && defined(__NR_process_vm_writev)
+# define SYS_process_vm_writev __NR_process_vm_writev
+#endif
+
+static pid_t g_self_pid = -1;
 
 // ===== 全局重定向目标 =====
 static const char* g_apk_path = nullptr;  // 原始 APK
@@ -163,6 +175,64 @@ static inline int c_copy_cstr_limited(char* dst, int dst_cap, const char* src, i
    }
    dst[n] = '\0';
    return n;
+}
+
+static inline ssize_t safe_read_self_mem(const void* remote_addr, void* local_buf, size_t len) {
+ #if !defined(SYS_process_vm_readv)
+   (void)remote_addr;
+   (void)local_buf;
+   (void)len;
+   return -1;
+ #else
+   if (g_self_pid <= 0 || remote_addr == nullptr || local_buf == nullptr || len == 0) return -1;
+   struct iovec local;
+   local.iov_base = local_buf;
+   local.iov_len = len;
+   struct iovec remote;
+   remote.iov_base = const_cast<void*>(remote_addr);
+   remote.iov_len = len;
+   long ret = raw_syscall6((long)SYS_process_vm_readv, (long)g_self_pid, (long)&local, 1, (long)&remote, 1, 0);
+   return (ssize_t)ret;
+ #endif
+}
+
+static inline ssize_t safe_write_self_mem(void* remote_addr, const void* local_buf, size_t len) {
+ #if !defined(SYS_process_vm_writev)
+   (void)remote_addr;
+   (void)local_buf;
+   (void)len;
+   return -1;
+ #else
+   if (g_self_pid <= 0 || remote_addr == nullptr || local_buf == nullptr || len == 0) return -1;
+   struct iovec local;
+   local.iov_base = const_cast<void*>(local_buf);
+   local.iov_len = len;
+   struct iovec remote;
+   remote.iov_base = remote_addr;
+   remote.iov_len = len;
+   long ret = raw_syscall6((long)SYS_process_vm_writev, (long)g_self_pid, (long)&local, 1, (long)&remote, 1, 0);
+   return (ssize_t)ret;
+ #endif
+}
+
+static inline int safe_copy_cstr_from_ptr(const void* remote_cstr, char* out, int out_cap) {
+   if (!out || out_cap <= 0) return -1;
+   out[0] = '\0';
+   if (!remote_cstr) return -1;
+
+   size_t want = (size_t)(out_cap - 1);
+   ssize_t n = safe_read_self_mem(remote_cstr, out, want);
+   if (n <= 0) {
+       out[0] = '\0';
+       return -1;
+   }
+   int limit = (int)((n < (ssize_t)want) ? n : (ssize_t)want);
+   int i = 0;
+   for (; i < limit; ++i) {
+       if (out[i] == '\0') break;
+   }
+   if (i == limit) out[limit] = '\0';
+   return 0;
 }
 
 static void* dbg_thread_main(void*) {
@@ -584,15 +654,24 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
 
    // --- openat(56)：如果 pathname 含 ".apk" 则改为 g_rep_path ---
    if (nr == kSysOpenat) {
-       const char* pathname = (const char*)a1;
+       const char* pathname_ptr = (const char*)a1;
+       char pathname[512];
+       pathname[0] = '\0';
+       (void)safe_copy_cstr_from_ptr((const void*)pathname_ptr, pathname, (int)sizeof(pathname));
        int did_redirect = 0;
-       if (pathname && g_apk_path && g_rep_path && g_apk_path[0] != '\0' && c_ends_with(pathname, g_apk_path)) {
-           a1 = (long)g_rep_path; // 替换路径
-           did_redirect = 1;
+       int opened_rep = 0;
+       if (pathname[0] != '\0' && g_apk_path && g_rep_path && g_apk_path[0] != '\0') {
+           if (c_ends_with(pathname, g_apk_path)) {
+               a1 = (long)g_rep_path; // 替换路径
+               did_redirect = 1;
+               opened_rep = 1;
+           } else if (g_rep_path[0] != '\0' && c_ends_with(pathname, g_rep_path)) {
+               opened_rep = 1;
+           }
        }
 
        long ret = raw_syscall6((long)kSysOpenat, a0, a1, a2, a3, 0, 0);
-       if (did_redirect && ret >= 0) {
+       if ((did_redirect || opened_rep) && ret >= 0) {
            mark_redirected_fd((int)ret);
        }
        SET_RET(ret);
@@ -602,13 +681,17 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
 
    // --- readlinkat(78)：如果要“伪造读到 apkPath”，直接在 handler 中写 buf 并返回长度；否则转发 ---
    if (nr == kSysReadlinkat) {
-       const char* pathname = (const char*)a1;
+       const char* pathname_ptr = (const char*)a1;
+       char pathname[256];
+       pathname[0] = '\0';
+       (void)safe_copy_cstr_from_ptr((const void*)pathname_ptr, pathname, (int)sizeof(pathname));
+
        char* buf = (char*)a2;
        long buflen = a3;
 
        dbg_write_line_78(pathname);
 
-       if (pathname && c_has_prefix(pathname, "/proc/self/fd/")) {
+       if (pathname[0] != '\0' && c_has_prefix(pathname, "/proc/self/fd/")) {
            int fd = -1;
            if (c_parse_int(pathname + 14, &fd) == 0 && is_redirected_fd(fd) && g_apk_path && g_apk_path[0] != '\0') {
                char tmp[512];
@@ -633,9 +716,16 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
                        } else {
                            long n = c_strlen(g_apk_path);
                            if (n >= buflen) n = buflen - 1;
-                           for (long i = 0; i < n; ++i) buf[i] = g_apk_path[i];
-                           buf[n] = '\0';
-                           SET_RET(n);
+                           char local_out[512];
+                           long nn = n;
+                           if (nn > (long)sizeof(local_out) - 1) nn = (long)sizeof(local_out) - 1;
+                           for (long i = 0; i < nn; ++i) local_out[i] = g_apk_path[i];
+                           local_out[nn] = '\0';
+                           if (safe_write_self_mem((void*)buf, local_out, (size_t)(nn + 1)) > 0) {
+                               SET_RET(nn);
+                           } else {
+                               SET_RET(-EFAULT);
+                           }
                        }
                        g_in_sigsys_handler = 0;
                        return;
@@ -646,16 +736,23 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
            }
        }
 
-       if (pathname && buf && g_apk_path && c_has_sub(pathname, "origin.apk")) {
+       if (pathname[0] != '\0' && buf && g_apk_path && c_has_sub(pathname, "origin.apk")) {
            // 伪造 readlinkat 结果：把 g_apk_path 拷到 buf，返回长度
            if (buflen <= 0) {
                SET_RET(-EINVAL);
            } else {
                long n = c_strlen(g_apk_path);
                if (n >= buflen) n = buflen - 1;
-               for (long i = 0; i < n; ++i) buf[i] = g_apk_path[i];
-               buf[n] = '\0';
-               SET_RET(n);
+               char local_out[512];
+               long nn = n;
+               if (nn > (long)sizeof(local_out) - 1) nn = (long)sizeof(local_out) - 1;
+               for (long i = 0; i < nn; ++i) local_out[i] = g_apk_path[i];
+               local_out[nn] = '\0';
+               if (safe_write_self_mem((void*)buf, local_out, (size_t)(nn + 1)) > 0) {
+                   SET_RET(nn);
+               } else {
+                   SET_RET(-EFAULT);
+               }
            }
            g_in_sigsys_handler = 0;
            return;
@@ -678,7 +775,7 @@ static int install_sigsys() {
    memset(&sa, 0, sizeof(sa));
    sigemptyset(&sa.sa_mask);
    sa.sa_sigaction = sigsys_handler;
-   sa.sa_flags = SA_SIGINFO;
+   sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTART;
    if (sigaction(SIGSYS, &sa, nullptr) != 0) {
        LOGE("sigaction(SIGSYS) failed");
        return -1;
@@ -701,6 +798,8 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
    g_apk_path = strdup(src ? src : "");
    g_rep_path = strdup(rep ? rep : "");
    LOGI("hookApkPath: src=%s, rep=%s", g_apk_path, g_rep_path);
+
+   g_self_pid = getpid();
 
    start_dbg_logger_once();
 

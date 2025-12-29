@@ -22,11 +22,22 @@ class Appinfos(
 
         try {
             val pm = context.packageManager
-            val pkgInfo = if (android.os.Build.VERSION.SDK_INT >= 28) {
-                pm.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+            val pkgInfo = when {
+                android.os.Build.VERSION.SDK_INT >= 33 -> {
+                    pm.getPackageInfo(
+                        packageName,
+                        PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
+                    )
+                }
+
+                android.os.Build.VERSION.SDK_INT >= 28 -> {
+                    pm.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+                }
+
+                else -> {
+                    @Suppress("DEPRECATION")
+                    pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+                }
             }
             this.packageName = pkgInfo.packageName
 
