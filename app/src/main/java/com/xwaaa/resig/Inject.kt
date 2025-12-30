@@ -301,11 +301,6 @@ class Injector {
                 return
             }
 
-            // 2️⃣ 打印反编译输出目录（调试用）
-            smaliDir.walkTopDown().forEach {
-                Log.d(TAG, "反编译输出: ${it.absolutePath}")
-            }
-
             // 3️⃣ 自动搜索 App.smali（避免包名写死）
             // 自动寻找 HookApplication 或 App.smali
             val appSmaliFile = smaliDir.walkTopDown()
@@ -313,9 +308,6 @@ class Injector {
 
             if (appSmaliFile == null) {
                 Log.e(TAG, "❌ 未找到 HookApplication.smali 或 App.smali，请检查反编译输出")
-                smaliDir.walkTopDown().forEach {
-                    Log.d(TAG, "反编译输出: ${it.absolutePath}")
-                }
                 return
             }
 

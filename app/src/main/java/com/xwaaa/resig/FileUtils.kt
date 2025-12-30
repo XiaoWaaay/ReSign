@@ -23,30 +23,29 @@ object FileUtils {
     @Throws(IOException::class)
     open fun copyFile(sourceFilePath: String, destDirectory: String?) {
         val sourceFile = File(sourceFilePath)
-        val destDir = File(destDirectory)
-        if (!destDir.exists()) {
-            destDir.mkdirs()
-        }
+        val destDir = File(destDirectory ?: "")
+        if (!destDir.exists()) destDir.mkdirs()
         val destFile = File(destDir, sourceFile.name)
         try {
-            val fis = FileInputStream(sourceFile)
-            val fos = FileOutputStream(destFile)
-            val buffer = ByteArray(1024)
-            while (true) {
-                val length = fis.read(buffer)
-                if (length > 0) {
-                    fos.write(buffer, 0, length)
-                } else {
-                    fos.close()
-                    fis.close()
-                    return
+            FileInputStream(sourceFile).use { fis ->
+                FileOutputStream(destFile).use { fos ->
+                    val buffer = ByteArray(256 * 1024)
+                    while (true) {
+                        val length = fis.read(buffer)
+                        if (length == -1) break
+                        fos.write(buffer, 0, length)
+                    }
+                    try {
+                        fos.fd.sync()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         } catch (e: FileNotFoundException) {
             throw FileNotFoundException("Source file not found: $sourceFilePath")
         } catch (e2: IOException) {
             throw IOException(
-                "Error copying file from " + sourceFilePath + " to " + destFile.absolutePath,
+                "Error copying file from $sourceFilePath to ${destFile.absolutePath}",
                 e2
             )
         }
@@ -55,27 +54,38 @@ object FileUtils {
     @Throws(IOException::class)
     open fun extractDexFile(apkFilePath: String, destDirectory: String) {
         val apkFile = File(apkFilePath)
+        if (!apkFile.exists()) throw FileNotFoundException("APK 未找到: $apkFilePath")
+
         val destDir = File(destDirectory).apply { if (!exists()) mkdirs() }
 
-        FileInputStream(apkFile).use { fis ->
-            ZipInputStream(fis).use { zis ->
-                val buffer = ByteArray(8192)
-                var entry: ZipEntry? = zis.nextEntry
-                while (entry != null) {
-                    val name = entry.name
-                    if (name.endsWith(".dex") && !name.contains("classesx.dex")) {
-                        val outFile = File(destDir, name)
-                        FileOutputStream(outFile).use { fos ->
-                            var len: Int
-                            while (zis.read(buffer).also { len = it } != -1) {
-                                fos.write(buffer, 0, len)
-                            }
+        java.util.zip.ZipFile(apkFile).use { zip ->
+            val entries = zip.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                val name = entry.name ?: continue
+                if (!name.endsWith(".dex")) continue
+                if (name.contains("classesx.dex")) continue
+                if (entry.isDirectory) continue
+
+                val outFile = File(destDir, name)
+                outFile.parentFile?.mkdirs()
+
+                zip.getInputStream(entry).use { input ->
+                    FileOutputStream(outFile).use { output ->
+                        val buffer = ByteArray(256 * 1024)
+                        while (true) {
+                            val n = input.read(buffer)
+                            if (n <= 0) break
+                            output.write(buffer, 0, n)
                         }
-                        Log.d("FileUtils", "✅ 解压Dex文件: ${outFile.absolutePath}")
+                        try {
+                            output.fd.sync()
+                        } catch (_: Throwable) {
+                        }
                     }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
                 }
+
+                Log.d("FileUtils", "✅ 解压Dex文件: ${outFile.absolutePath}")
             }
         }
     }

@@ -95,7 +95,7 @@ static unsigned char g_redirected_fds[kMaxTrackedFd];
 static int g_dbg_pipe_w = -1;
 static int g_dbg_pipe_r = -1;
 static int g_dbg_started = 0;
-static int g_dbg_enabled = 1;
+static int g_dbg_enabled = 0;
 static pthread_t g_dbg_thread;
 
 // ===== 简单 async-signal-safe 字符串工具 =====
@@ -578,13 +578,19 @@ static int install_seccomp_filter_all_threads() {
 
 #if defined(SYS_seccomp)
    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) != 0) {
-       LOGE("seccomp(TSYNC) failed");
-       return -1;
+       int err = errno;
+       if (err != EINVAL || syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) != 0) {
+           LOGE("seccomp install failed: %d", (err != EINVAL) ? err : errno);
+           return -1;
+       }
    }
 #elif defined(__NR_seccomp)
    if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) != 0) {
-       LOGE("seccomp(TSYNC) failed");
-       return -1;
+       int err = errno;
+       if (err != EINVAL || syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) != 0) {
+           LOGE("seccomp install failed: %d", (err != EINVAL) ? err : errno);
+           return -1;
+       }
    }
 #else
    LOGE("seccomp syscall not available");
@@ -721,10 +727,11 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
                            if (nn > (long)sizeof(local_out) - 1) nn = (long)sizeof(local_out) - 1;
                            for (long i = 0; i < nn; ++i) local_out[i] = g_apk_path[i];
                            local_out[nn] = '\0';
-                           if (safe_write_self_mem((void*)buf, local_out, (size_t)(nn + 1)) > 0) {
+                           if (safe_write_self_mem((void*)buf, local_out, (size_t)(nn + 1)) == (ssize_t)(nn + 1)) {
                                SET_RET(nn);
                            } else {
-                               SET_RET(-EFAULT);
+                               long real_ret = raw_syscall6((long)kSysReadlinkat, a0, a1, a2, a3, 0, 0);
+                               SET_RET(real_ret);
                            }
                        }
                        g_in_sigsys_handler = 0;
@@ -748,10 +755,11 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
                if (nn > (long)sizeof(local_out) - 1) nn = (long)sizeof(local_out) - 1;
                for (long i = 0; i < nn; ++i) local_out[i] = g_apk_path[i];
                local_out[nn] = '\0';
-               if (safe_write_self_mem((void*)buf, local_out, (size_t)(nn + 1)) > 0) {
+               if (safe_write_self_mem((void*)buf, local_out, (size_t)(nn + 1)) == (ssize_t)(nn + 1)) {
                    SET_RET(nn);
                } else {
-                   SET_RET(-EFAULT);
+                   long real_ret = raw_syscall6((long)kSysReadlinkat, a0, a1, a2, a3, 0, 0);
+                   SET_RET(real_ret);
                }
            }
            g_in_sigsys_handler = 0;
@@ -775,7 +783,7 @@ static int install_sigsys() {
    memset(&sa, 0, sizeof(sa));
    sigemptyset(&sa.sa_mask);
    sa.sa_sigaction = sigsys_handler;
-   sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTART;
+   sa.sa_flags = SA_SIGINFO | SA_RESTART;
    if (sigaction(SIGSYS, &sa, nullptr) != 0) {
        LOGE("sigaction(SIGSYS) failed");
        return -1;
@@ -801,7 +809,13 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
 
    g_self_pid = getpid();
 
-   start_dbg_logger_once();
+   if (g_dbg_enabled) start_dbg_logger_once();
+
+   if (!g_apk_path || !g_rep_path || g_apk_path[0] == '\0' || g_rep_path[0] == '\0' || strcmp(g_apk_path, g_rep_path) == 0) {
+       env->ReleaseStringUTFChars(jSourcePath, src);
+       env->ReleaseStringUTFChars(jRepPath, rep);
+       return;
+   }
 
    if (find_self_map_range(&g_self_map_start, &g_self_map_end_inclusive) != 0) {
        LOGE("find_self_map_range failed");

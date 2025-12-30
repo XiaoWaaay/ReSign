@@ -5,7 +5,6 @@ import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
@@ -13,6 +12,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -35,18 +36,32 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             ResigTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    InstalledAppsList()
+                val snackbarHostState = remember { SnackbarHostState() }
+                val scope = rememberCoroutineScope()
+                val showMessage: (String) -> Unit = { msg ->
+                    scope.launch {
+                        snackbarHostState.showSnackbar(msg)
+                    }
+                }
+
+                Scaffold(
+                    snackbarHost = { SnackbarHost(hostState = snackbarHostState) }
+                ) { padding ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(padding),
+                        color = MaterialTheme.colorScheme.background
+                    ) {
+                        InstalledAppsList(showMessage = showMessage)
+                    }
                 }
             }
         }
     }
 
     @Composable
-    fun InstalledAppsList() {
+    fun InstalledAppsList(showMessage: (String) -> Unit) {
         val pm = packageManager
         val ctx = LocalContext.current
         val installedApps = getInstalledApps()
@@ -56,7 +71,7 @@ class MainActivity : ComponentActivity() {
                 val pkgInfo = installedApps[index]
                 val appName = pkgInfo.applicationInfo.loadLabel(pm).toString()
                 val packageName = pkgInfo.packageName
-                val sourceApk = pkgInfo.applicationInfo.sourceDir
+                val sourceApk = pkgInfo.applicationInfo.publicSourceDir ?: pkgInfo.applicationInfo.sourceDir
                 // 构造传入 onSignClick 的 Appinfo
                 val appinfo = Appinfos(name = appName, packageName = packageName, packagePath = sourceApk, signatures = null)
 
@@ -89,7 +104,8 @@ class MainActivity : ComponentActivity() {
                                     appName = appName,
                                     appinfo = appinfo,
                                     context = ctx,
-                                    packageName = packageName
+                                    packageName = packageName,
+                                    showMessage = showMessage
                                 )
                             },
                             modifier = Modifier.padding(start = 16.dp)
@@ -113,27 +129,28 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onAppClick(appName: String) {
-        Toast.makeText(this, "点击了 $appName", Toast.LENGTH_SHORT).show()
+        Log.d(TAG, "点击了 $appName")
     }
 
     private fun onSignClick(
         appName: String,
         appinfo: Appinfos,
         context: Context,
-        packageName: String? = null
+        packageName: String? = null,
+        showMessage: (String) -> Unit
     ) {
-        Toast.makeText(context, "准备处理 $appName ...", Toast.LENGTH_SHORT).show()
+        showMessage("准备处理 $appName ...")
 
         // ✅ 使用协程后台执行
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 Core(appinfo, context).begin()
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "$appName 去签完成！", Toast.LENGTH_SHORT).show()
+                    showMessage("$appName 去签完成！")
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "去签失败: ${e.message}", Toast.LENGTH_LONG).show()
+                    showMessage("去签失败: ${e.message}")
                 }
                 Log.e("MainActivity", "去签出错: ${e.message}")
             }
@@ -141,4 +158,3 @@ class MainActivity : ComponentActivity() {
     }
 
 }
-

@@ -826,9 +826,12 @@ public class HookApplication extends Application {
             }
             File apkFile = new File(apkPath);
 
-            // 3) 准备 /data/data/<pkg>/origin.apk
+            // 3) 准备 /data/data/<pkg>/assets/KillSig/origin.apk
             File dataDir = ensureDataDir(pkg);
-            File redirected = new File(dataDir, "origin.apk");
+            File redirectedDir = new File(new File(dataDir, "assets"), "KillSig");
+            //noinspection ResultOfMethodCallIgnored
+            redirectedDir.mkdirs();
+            File redirected = new File(redirectedDir, "origin.apk");
 
             // 4) 若不存在或大小不一致，则从 assets/KillSig/origin.apk 解压一份
             try (ZipFile zip = new ZipFile(apkFile)) {
@@ -856,7 +859,7 @@ public class HookApplication extends Application {
                 Log.e(TAG, "提取 META-INF 失败: " + t.getMessage(), t);
             }
 
-            // 5) 安装 SVC 拦截（把 base.apk 重定向到 /data/data/.../origin.apk）
+            // 5) 安装 SVC 拦截（把 base.apk 重定向到 /data/data/.../assets/KillSig/origin.apk）
             String sourcePath;
             String redirectedPath;
             try {
@@ -876,6 +879,12 @@ public class HookApplication extends Application {
                 Log.e(TAG, "patchRuntimeApkPath 失败: " + t.getMessage(), t);
             }
 
+            try {
+                patchLoadedDexPaths(pkg, sourcePath, redirectedPath);
+            } catch (Throwable t) {
+                Log.e(TAG, "patchLoadedDexPaths 失败: " + t.getMessage(), t);
+            }
+
             hookApkPath(sourcePath, redirectedPath);
             Log.d(TAG, "killOpen: io重定向 完成");
             return true;
@@ -883,6 +892,597 @@ public class HookApplication extends Application {
             Log.e(TAG, "加载/安装 native 重定向失败: " + t.getMessage(), t);
             return false;
         }
+    }
+
+    private static void patchLoadedDexPaths(String pkg, String baseApkPath, String redirectedApkPath) {
+        if (pkg == null || baseApkPath == null || redirectedApkPath == null) return;
+
+        try {
+            Log.d(TAG, "patchLoadedDexPaths: base=" + baseApkPath + " redir=" + redirectedApkPath);
+
+            ClassLoader[] loaders = collectCandidateClassLoaders(pkg);
+            int patched = 0;
+            for (ClassLoader cl : loaders) {
+                patched += patchClassLoaderDexPaths(cl, pkg, baseApkPath, redirectedApkPath);
+            }
+
+            String hitClassName = null;
+            ClassLoader hitLoader = null;
+            for (ClassLoader cl : loaders) {
+                if (cl == null) continue;
+                try {
+                    Class<?> c = findClassWithNoArgMethod(cl, baseApkPath, "getLoadedDexPaths");
+                    if (c != null) {
+                        hitClassName = c.getName();
+                        hitLoader = cl;
+                        break;
+                    }
+                } catch (Throwable t) {
+                    Log.e(TAG, "patchLoadedDexPaths: scan loader failed: " + cl.getClass().getName() + " " + t.getClass().getName());
+                }
+            }
+
+            if (hitClassName == null) {
+                Log.e(TAG, "patchLoadedDexPaths: class not found");
+                if (patched == 0) startDexPathPatcherRetryThread(pkg, baseApkPath, redirectedApkPath);
+                return;
+            }
+
+            Log.d(TAG, "patchLoadedDexPaths: hitClass=" + hitClassName + " loader=" + (hitLoader == null ? "null" : hitLoader.getClass().getName()));
+
+            int patchedFields = 0;
+            for (ClassLoader cl : loaders) {
+                if (cl == null) continue;
+                Class<?> c;
+                try {
+                    c = Class.forName(hitClassName, false, cl);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                try {
+                    Method m = c.getDeclaredMethod("getLoadedDexPaths");
+                    if (m.getParameterTypes().length != 0) continue;
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                patchedFields += patchStaticValuesInClass(c, pkg, redirectedApkPath, baseApkPath);
+            }
+
+            Log.d(TAG, "patchLoadedDexPaths: patchedDexElements=" + patched + " patchedFields=" + patchedFields);
+            if (patched == 0 && patchedFields == 0) startDexPathPatcherRetryThread(pkg, baseApkPath, redirectedApkPath);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static int patchClassLoaderDexPaths(ClassLoader cl, String pkg, String baseApkPath, String redirectedApkPath) {
+        if (cl == null || pkg == null || baseApkPath == null || redirectedApkPath == null) return 0;
+
+        int patched = 0;
+        try {
+            Class<?> bdc = Class.forName("dalvik.system.BaseDexClassLoader");
+            if (!bdc.isInstance(cl)) return 0;
+
+            Field fPathList = findField(bdc, "pathList");
+            Object pathList = fPathList.get(cl);
+            if (pathList == null) return 0;
+
+            Field fDexElements = findField(pathList.getClass(), "dexElements");
+            Object[] elements = (Object[]) fDexElements.get(pathList);
+            if (elements == null) return 0;
+
+            for (Object el : elements) {
+                if (el == null) continue;
+                patched += patchDexElement(el, pkg, baseApkPath, redirectedApkPath);
+            }
+        } catch (Throwable ignored) {
+        }
+        return patched;
+    }
+
+    private static int patchDexElement(Object element, String pkg, String baseApkPath, String redirectedApkPath) {
+        int patched = 0;
+        try {
+            Field[] fields = element.getClass().getDeclaredFields();
+
+            boolean isBaseElement = false;
+            for (Field f : fields) {
+                f.setAccessible(true);
+                Object v;
+                try {
+                    v = f.get(element);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+
+                if (v instanceof String) {
+                    String s = (String) v;
+                    if (replaceApkPathInText(pkg, s, baseApkPath, redirectedApkPath) != null) {
+                        isBaseElement = true;
+                        break;
+                    }
+                } else if (v instanceof File) {
+                    String p;
+                    try {
+                        p = ((File) v).getPath();
+                    } catch (Throwable ignored) {
+                        p = null;
+                    }
+                    if (replaceApkPathInText(pkg, p, baseApkPath, redirectedApkPath) != null) {
+                        isBaseElement = true;
+                        break;
+                    }
+                } else if (v instanceof dalvik.system.DexFile) {
+                    String n;
+                    try {
+                        n = ((dalvik.system.DexFile) v).getName();
+                    } catch (Throwable ignored) {
+                        n = null;
+                    }
+                    if (replaceApkPathInText(pkg, n, baseApkPath, redirectedApkPath) != null) {
+                        isBaseElement = true;
+                        break;
+                    }
+                }
+            }
+
+            for (Field f : fields) {
+                f.setAccessible(true);
+                Object v;
+                try {
+                    v = f.get(element);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+
+                if (v instanceof String) {
+                    String s = (String) v;
+                    if (s != null && s.contains(redirectedApkPath)) {
+                        if (forceSet(f, element, s.replace(redirectedApkPath, baseApkPath))) patched++;
+                    }
+                } else if (v instanceof File) {
+                    String p;
+                    try {
+                        p = ((File) v).getPath();
+                    } catch (Throwable ignored) {
+                        p = null;
+                    }
+                    if (p != null && p.contains(redirectedApkPath)) {
+                        if (forceSet(f, element, new File(p.replace(redirectedApkPath, baseApkPath)))) patched++;
+                    }
+                }
+            }
+
+            if (isBaseElement) {
+                dalvik.system.DexFile redirectedDex;
+                try {
+                    redirectedDex = new dalvik.system.DexFile(redirectedApkPath);
+                } catch (Throwable ignored) {
+                    redirectedDex = null;
+                }
+
+                if (redirectedDex != null) {
+                    patchDexFileName(redirectedDex, pkg, redirectedApkPath, baseApkPath);
+                    for (Field f : fields) {
+                        Class<?> t;
+                        try {
+                            t = f.getType();
+                        } catch (Throwable ignored) {
+                            continue;
+                        }
+                        if (t == null) continue;
+                        if (!dalvik.system.DexFile.class.isAssignableFrom(t)) continue;
+                        if (forceSet(f, element, redirectedDex)) patched++;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return patched;
+    }
+
+    private static int patchDexFileName(dalvik.system.DexFile dexFile, String pkg, String baseApkPath, String redirectedApkPath) {
+        if (dexFile == null) return 0;
+        int patched = 0;
+        try {
+            Field[] fields = dalvik.system.DexFile.class.getDeclaredFields();
+            for (Field f : fields) {
+                Class<?> t = f.getType();
+                if (t != String.class && t != File.class) continue;
+                f.setAccessible(true);
+                Object v;
+                try {
+                    v = f.get(dexFile);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                if (v instanceof String) {
+                    String s = (String) v;
+                    String ns = replaceApkPathInText(pkg, s, baseApkPath, redirectedApkPath);
+                    if (ns != null) {
+                        if (forceSet(f, dexFile, ns)) patched++;
+                    }
+                } else if (v instanceof File) {
+                    String p;
+                    try {
+                        p = ((File) v).getPath();
+                    } catch (Throwable ignored) {
+                        p = null;
+                    }
+                    String np = replaceApkPathInText(pkg, p, baseApkPath, redirectedApkPath);
+                    if (np != null) {
+                        if (forceSet(f, dexFile, new File(np))) patched++;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return patched;
+    }
+
+    private static int patchStaticValuesInClass(Class<?> cls, String pkg, String baseApkPath, String redirectedApkPath) {
+        if (cls == null) return 0;
+        int patched = 0;
+        try {
+            Field[] fields = cls.getDeclaredFields();
+            for (Field f : fields) {
+                if ((f.getModifiers() & java.lang.reflect.Modifier.STATIC) == 0) continue;
+                f.setAccessible(true);
+                Object v;
+                try {
+                    v = f.get(null);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+
+                if (v instanceof String) {
+                    String s = (String) v;
+                    String ns = replaceApkPathInText(pkg, s, baseApkPath, redirectedApkPath);
+                    if (ns != null) {
+                        if (forceSet(f, null, ns)) patched++;
+                    }
+                } else if (v instanceof String[]) {
+                    String[] arr = (String[]) v;
+                    boolean changed = false;
+                    for (int i = 0; i < arr.length; i++) {
+                        String s = arr[i];
+                        String ns = replaceApkPathInText(pkg, s, baseApkPath, redirectedApkPath);
+                        if (ns != null) {
+                            arr[i] = ns;
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        if (forceSet(f, null, arr)) patched++;
+                    }
+                } else if (v instanceof java.util.List) {
+                    java.util.List<?> list = (java.util.List<?>) v;
+                    java.util.List<Object> copy = new java.util.ArrayList<Object>(list.size());
+                    boolean changed = false;
+                    for (Object o : list) {
+                        if (o instanceof String) {
+                            String s = (String) o;
+                            String ns = replaceApkPathInText(pkg, s, baseApkPath, redirectedApkPath);
+                            if (ns != null) {
+                                copy.add(ns);
+                                changed = true;
+                            } else {
+                                copy.add(s);
+                            }
+                        } else if (o instanceof File) {
+                            String p;
+                            try {
+                                p = ((File) o).getPath();
+                            } catch (Throwable ignored) {
+                                p = null;
+                            }
+                            String np = replaceApkPathInText(pkg, p, baseApkPath, redirectedApkPath);
+                            if (np != null) {
+                                copy.add(new File(np));
+                                changed = true;
+                            } else {
+                                copy.add(o);
+                            }
+                        } else {
+                            copy.add(o);
+                        }
+                    }
+                    if (changed) {
+                        if (forceSet(f, null, copy)) patched++;
+                    }
+                } else if (v instanceof File) {
+                    String p;
+                    try {
+                        p = ((File) v).getPath();
+                    } catch (Throwable ignored) {
+                        p = null;
+                    }
+                    String np = replaceApkPathInText(pkg, p, baseApkPath, redirectedApkPath);
+                    if (np != null) {
+                        if (forceSet(f, null, new File(np))) patched++;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return patched;
+    }
+
+    private static String replaceApkPathInText(String pkg, String text, String baseApkPath, String redirectedApkPath) {
+        if (pkg == null || text == null || baseApkPath == null || redirectedApkPath == null) return null;
+        if (text.contains(baseApkPath)) return text.replace(baseApkPath, redirectedApkPath);
+
+        int idx = text.indexOf("/base.apk");
+        if (idx < 0) return null;
+
+        int start = text.indexOf('/');
+        if (start < 0 || start >= idx) return null;
+
+        int end = idx + "/base.apk".length();
+        if (end > text.length()) return null;
+
+        String candidate = text.substring(start, end);
+        if (!isApkPathOf(pkg, candidate)) return null;
+        return text.substring(0, start) + redirectedApkPath + text.substring(end);
+    }
+
+    private static boolean forceSet(Field f, Object receiver, Object value) {
+        if (f == null) return false;
+        try {
+            f.setAccessible(true);
+            f.set(receiver, value);
+            return true;
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            makeFieldNonFinal(f);
+            f.setAccessible(true);
+            f.set(receiver, value);
+            return true;
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private static void makeFieldNonFinal(Field f) {
+        try {
+            Field af = Field.class.getDeclaredField("accessFlags");
+            af.setAccessible(true);
+            int flags = af.getInt(f);
+            flags &= ~java.lang.reflect.Modifier.FINAL;
+            af.setInt(f, flags);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Field mf = Field.class.getDeclaredField("modifiers");
+            mf.setAccessible(true);
+            int m = mf.getInt(f);
+            m &= ~java.lang.reflect.Modifier.FINAL;
+            mf.setInt(f, m);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Class<?> findClassWithNoArgMethod(ClassLoader cl, String baseApkPath, String methodName) {
+        if (cl == null || baseApkPath == null || methodName == null) return null;
+
+        long t0 = android.os.SystemClock.uptimeMillis();
+
+        java.util.List<Object> dexFiles = new java.util.ArrayList<Object>(4);
+        try {
+            Class<?> bdc = Class.forName("dalvik.system.BaseDexClassLoader");
+            if (bdc.isInstance(cl)) {
+                Field fPathList = findField(bdc, "pathList");
+                Object pathList = fPathList.get(cl);
+                if (pathList != null) {
+                    Field fDexElements = findField(pathList.getClass(), "dexElements");
+                    Object[] elements = (Object[]) fDexElements.get(pathList);
+                    if (elements != null) {
+                        Log.d(TAG, "dexScan: loader=" + cl.getClass().getName() + " dexElements=" + elements.length);
+                        for (Object el : elements) {
+                            if (el == null) continue;
+                            try {
+                                Field fDexFile = findField(el.getClass(), "dexFile");
+                                Object dexFile = fDexFile.get(el);
+                                if (dexFile != null) dexFiles.add(dexFile);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (dexFiles.isEmpty()) {
+            try {
+                dalvik.system.DexFile dex = new dalvik.system.DexFile(baseApkPath);
+                dexFiles.add(dex);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        int scannedClasses = 0;
+        for (Object dexObj : dexFiles) {
+            if (dexObj == null) continue;
+            dalvik.system.DexFile dex = null;
+            boolean needClose = false;
+            try {
+                if (dexObj instanceof dalvik.system.DexFile) {
+                    dex = (dalvik.system.DexFile) dexObj;
+                } else {
+                    continue;
+                }
+                java.util.Enumeration<String> en = dex.entries();
+                while (en != null && en.hasMoreElements()) {
+                    String cn = en.nextElement();
+                    if (cn == null || cn.length() == 0) continue;
+                    scannedClasses++;
+                    Class<?> c;
+                    try {
+                        c = Class.forName(cn, false, cl);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    try {
+                        Method m = c.getDeclaredMethod(methodName);
+                        if (m.getParameterTypes().length == 0) return c;
+                    } catch (Throwable ignored) {
+                    }
+                    if (android.os.SystemClock.uptimeMillis() - t0 > 350) {
+                        Log.e(TAG, "dexScan: timeout loader=" + cl.getClass().getName() + " scanned=" + scannedClasses);
+                        return null;
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (needClose && dex != null) {
+                    try {
+                        dex.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+
+        Log.d(TAG, "dexScan: not found loader=" + cl.getClass().getName() + " scanned=" + scannedClasses);
+
+        return null;
+    }
+
+    private static ClassLoader[] collectCandidateClassLoaders(String pkg) {
+        java.util.LinkedHashSet<ClassLoader> out = new java.util.LinkedHashSet<ClassLoader>();
+
+        try {
+            out.add(HookApplication.class.getClassLoader());
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            out.add(Thread.currentThread().getContextClassLoader());
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Application app = sApp;
+            if (app == null) {
+                app = resolveCurrentApplication();
+                if (app != null) sApp = app;
+            }
+            if (app != null) {
+                out.add(app.getClassLoader());
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Class<?> atClz = Class.forName("android.app.ActivityThread");
+            Method cur = atClz.getDeclaredMethod("currentActivityThread");
+            cur.setAccessible(true);
+            Object at = cur.invoke(null);
+            if (at != null) {
+                Field fPkgs = atClz.getDeclaredField("mPackages");
+                fPkgs.setAccessible(true);
+                Object pkgs = fPkgs.get(at);
+                if (pkgs instanceof Map) {
+                    Object ref = ((Map<?, ?>) pkgs).get(pkg);
+                    Object loadedApk = ref;
+                    if (ref instanceof WeakReference) {
+                        loadedApk = ((WeakReference<?>) ref).get();
+                    }
+                    if (loadedApk != null) {
+                        try {
+                            Field fCl = findField(loadedApk.getClass(), "mClassLoader");
+                            Object cl = fCl.get(loadedApk);
+                            if (cl instanceof ClassLoader) out.add((ClassLoader) cl);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        java.util.ArrayList<ClassLoader> list = new java.util.ArrayList<ClassLoader>(out);
+        return list.toArray(new ClassLoader[0]);
+    }
+
+    private static final AtomicBoolean DEXPATCH_STARTED = new AtomicBoolean(false);
+    private static final AtomicBoolean DEXPATCH_DONE = new AtomicBoolean(false);
+
+    private static void startDexPathPatcherRetryThread(final String pkg, final String baseApkPath, final String redirectedApkPath) {
+        if (DEXPATCH_DONE.get()) return;
+        if (!DEXPATCH_STARTED.compareAndSet(false, true)) return;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < 80 && !DEXPATCH_DONE.get(); i++) {
+                    try {
+                        int patched = tryPatchLoadedDexPathsOnce(pkg, baseApkPath, redirectedApkPath);
+                        if (patched > 0) {
+                            DEXPATCH_DONE.set(true);
+                            Log.d(TAG, "patchLoadedDexPaths: done after retry patched=" + patched);
+                            return;
+                        }
+                    } catch (Throwable t) {
+                        Log.e(TAG, "patchLoadedDexPaths: retry error " + t.getClass().getName());
+                    }
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException ignored) {
+                        return;
+                    }
+                }
+            }
+        }, "dexpath-patcher");
+        try {
+            t.setDaemon(true);
+        } catch (Throwable ignored) {
+        }
+        t.start();
+    }
+
+    private static int tryPatchLoadedDexPathsOnce(String pkg, String baseApkPath, String redirectedApkPath) {
+        if (pkg == null || baseApkPath == null || redirectedApkPath == null) return 0;
+
+        ClassLoader[] loaders = collectCandidateClassLoaders(pkg);
+
+        int patched = 0;
+        for (ClassLoader cl : loaders) {
+            patched += patchClassLoaderDexPaths(cl, pkg, baseApkPath, redirectedApkPath);
+        }
+
+        String hitClassName = null;
+        for (ClassLoader cl : loaders) {
+            if (cl == null) continue;
+            try {
+                Class<?> c = findClassWithNoArgMethod(cl, baseApkPath, "getLoadedDexPaths");
+                if (c != null) {
+                    hitClassName = c.getName();
+                    break;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (hitClassName == null) return patched;
+
+        for (ClassLoader cl : loaders) {
+            if (cl == null) continue;
+            Class<?> c;
+            try {
+                c = Class.forName(hitClassName, false, cl);
+            } catch (Throwable ignored) {
+                continue;
+            }
+            try {
+                Method m = c.getDeclaredMethod("getLoadedDexPaths");
+                if (m.getParameterTypes().length != 0) continue;
+            } catch (Throwable ignored) {
+                continue;
+            }
+            patched += patchStaticValuesInClass(c, pkg, redirectedApkPath, baseApkPath);
+        }
+        return patched;
     }
 
     private static void patchRuntimeApkPath(String pkg, String baseApkPath, String redirectedApkPath) throws Exception {

@@ -1,6 +1,8 @@
 package com.xwaaa.resig;
 
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.os.Environment;
 import android.util.Base64;
@@ -21,8 +23,21 @@ public class Core {
     }
     public void begin(){
         File[] dex_s=null;
-        String targetPackagePath = this.appinfo.getPackagePath();
         String targetPackageName = this.appinfo.getPackageName();
+        String targetPackagePath = this.appinfo.getPackagePath();
+
+        try {
+            if (targetPackageName != null && !targetPackageName.isEmpty()) {
+                PackageManager pm = this.context.getPackageManager();
+                ApplicationInfo ai = pm.getApplicationInfo(targetPackageName, 0);
+                if (ai != null) {
+                    String p = ai.publicSourceDir;
+                    if (p == null || p.isEmpty()) p = ai.sourceDir;
+                    if (p != null && !p.isEmpty()) targetPackagePath = p;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
         Log.d(TAG,"去签APP路径："+targetPackagePath+"\n去签APP的包名："+targetPackageName);
 
         //拼接一下目录路径
@@ -31,7 +46,29 @@ public class Core {
 
         try{
             //读取目标路径与工作目录，然后将其复制拷贝到工作目录
-            FileUtils.INSTANCE.copyFile(targetPackagePath,workDir);
+            try {
+                FileUtils.INSTANCE.copyFile(targetPackagePath,workDir);
+            } catch (Exception first) {
+                Log.e("Error","将原文件复制到工作目录出错: "+targetPackagePath, first);
+                String fallback = null;
+                try {
+                    if (targetPackageName != null && !targetPackageName.isEmpty()) {
+                        PackageManager pm = this.context.getPackageManager();
+                        ApplicationInfo ai = pm.getApplicationInfo(targetPackageName, 0);
+                        if (ai != null) {
+                            fallback = ai.sourceDir;
+                            if (fallback == null || fallback.isEmpty()) fallback = ai.publicSourceDir;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (fallback != null && !fallback.isEmpty() && !fallback.equals(targetPackagePath)) {
+                    targetPackagePath = fallback;
+                    FileUtils.INSTANCE.copyFile(targetPackagePath, workDir);
+                } else {
+                    throw first;
+                }
+            }
             Log.d(TAG,"将原文件复制到工作目录成功");
             appinfo.ensureSignatures(context);
             Log.d(TAG,"调用appinfo去获取原始签名值");
@@ -148,11 +185,11 @@ public class Core {
                     Log.e("Error","从APK中解压xml文件报错"+e3);
                 }
             }catch (Exception e2){
-                Log.e("Error","解压dex文件出错");
+                Log.e("Error","解压dex文件出错", e2);
             }
 
         }catch (Exception e1){
-            Log.e("Error","将原文件复制到工作目录出错，请检查是否有参数错误");
+            Log.e("Error","将原文件复制到工作目录出错，请检查是否有参数错误", e1);
         }
 
     }
