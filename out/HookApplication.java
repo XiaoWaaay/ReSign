@@ -1054,6 +1054,7 @@ public class HookApplication extends Application {
 
             if (isBaseElement) {
                 dalvik.system.DexFile redirectedDex;
+                boolean attached = false;
                 try {
                     redirectedDex = new dalvik.system.DexFile(redirectedApkPath);
                 } catch (Throwable ignored) {
@@ -1071,7 +1072,17 @@ public class HookApplication extends Application {
                         }
                         if (t == null) continue;
                         if (!dalvik.system.DexFile.class.isAssignableFrom(t)) continue;
-                        if (forceSet(f, element, redirectedDex)) patched++;
+                        if (forceSet(f, element, redirectedDex)) {
+                            patched++;
+                            attached = true;
+                        }
+                    }
+
+                    if (!attached) {
+                        try {
+                            redirectedDex.close();
+                        } catch (Throwable ignored) {
+                        }
                     }
                 }
             }
@@ -1268,7 +1279,31 @@ public class HookApplication extends Application {
 
         long t0 = android.os.SystemClock.uptimeMillis();
 
-        java.util.List<Object> dexFiles = new java.util.ArrayList<Object>(4);
+        try {
+            String[] known = new String[]{
+                    "android.app.ApplicationLoaders",
+                    "android.app.LoadedApk",
+                    "dalvik.system.DexPathList"
+            };
+            for (String n : known) {
+                if (n == null) continue;
+                Class<?> c;
+                try {
+                    c = Class.forName(n, false, cl);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                try {
+                    Method m = c.getDeclaredMethod(methodName);
+                    if (m.getParameterTypes().length == 0) return c;
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        java.util.ArrayList<dalvik.system.DexFile> dexFiles = new java.util.ArrayList<dalvik.system.DexFile>(4);
+        java.util.ArrayList<Boolean> needClose = new java.util.ArrayList<Boolean>(4);
         try {
             Class<?> bdc = Class.forName("dalvik.system.BaseDexClassLoader");
             if (bdc.isInstance(cl)) {
@@ -1284,7 +1319,10 @@ public class HookApplication extends Application {
                             try {
                                 Field fDexFile = findField(el.getClass(), "dexFile");
                                 Object dexFile = fDexFile.get(el);
-                                if (dexFile != null) dexFiles.add(dexFile);
+                                if (dexFile instanceof dalvik.system.DexFile) {
+                                    dexFiles.add((dalvik.system.DexFile) dexFile);
+                                    needClose.add(false);
+                                }
                             } catch (Throwable ignored) {
                             }
                         }
@@ -1298,21 +1336,23 @@ public class HookApplication extends Application {
             try {
                 dalvik.system.DexFile dex = new dalvik.system.DexFile(baseApkPath);
                 dexFiles.add(dex);
+                needClose.add(true);
             } catch (Throwable ignored) {
             }
         }
 
         int scannedClasses = 0;
-        for (Object dexObj : dexFiles) {
-            if (dexObj == null) continue;
-            dalvik.system.DexFile dex = null;
-            boolean needClose = false;
-            try {
-                if (dexObj instanceof dalvik.system.DexFile) {
-                    dex = (dalvik.system.DexFile) dexObj;
-                } else {
-                    continue;
+        for (int i = 0; i < dexFiles.size(); i++) {
+            dalvik.system.DexFile dex = dexFiles.get(i);
+            if (dex == null) continue;
+            boolean closeIt = false;
+            if (i >= 0 && i < needClose.size()) {
+                try {
+                    closeIt = Boolean.TRUE.equals(needClose.get(i));
+                } catch (Throwable ignored) {
                 }
+            }
+            try {
                 java.util.Enumeration<String> en = dex.entries();
                 while (en != null && en.hasMoreElements()) {
                     String cn = en.nextElement();
@@ -1336,7 +1376,7 @@ public class HookApplication extends Application {
                 }
             } catch (Throwable ignored) {
             } finally {
-                if (needClose && dex != null) {
+                if (closeIt && dex != null) {
                     try {
                         dex.close();
                     } catch (Throwable ignored) {
