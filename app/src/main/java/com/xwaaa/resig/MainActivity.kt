@@ -85,6 +85,9 @@ class MainActivity : ComponentActivity() {
         var enableIoRedirect by remember { mutableStateOf(true) }
         var enableMapsHide by remember { mutableStateOf(prefs.getBoolean("enableMapsHide", true)) }
         var enableResourceRedirect by remember { mutableStateOf(false) }
+        var debugLog by remember { mutableStateOf(prefs.getBoolean("debugLog", false)) }
+        var hookMode by remember { mutableStateOf(prefs.getString("hookMode", "standard") ?: "standard") }
+        var enableDeepHide by remember { mutableStateOf(prefs.getBoolean("enableDeepHide", true)) }
         var enableCache by remember { mutableStateOf(true) }
         var enablePayloadDexCache by remember { mutableStateOf(true) }
 
@@ -171,6 +174,58 @@ class MainActivity : ComponentActivity() {
                 Text(text = "启用 maps 隐藏（实验）")
             }
 
+            Text(text = "运行期模式", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(
+                    selected = hookMode == "safe",
+                    onClick = {
+                        hookMode = "safe"
+                        prefs.edit().putString("hookMode", hookMode).apply()
+                    }
+                )
+                Text(text = "SAFE")
+                Spacer(modifier = Modifier.width(10.dp))
+                RadioButton(
+                    selected = hookMode == "standard",
+                    onClick = {
+                        hookMode = "standard"
+                        prefs.edit().putString("hookMode", hookMode).apply()
+                    }
+                )
+                Text(text = "STANDARD")
+                Spacer(modifier = Modifier.width(10.dp))
+                RadioButton(
+                    selected = hookMode == "aggressive",
+                    onClick = {
+                        hookMode = "aggressive"
+                        prefs.edit().putString("hookMode", hookMode).apply()
+                    }
+                )
+                Text(text = "AGGRESSIVE")
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = enableDeepHide,
+                    onCheckedChange = {
+                        enableDeepHide = it
+                        prefs.edit().putBoolean("enableDeepHide", it).apply()
+                    }
+                )
+                Text(text = "启用 Deep Hide（高风险）")
+                Spacer(modifier = Modifier.width(12.dp))
+                Checkbox(
+                    checked = debugLog,
+                    onCheckedChange = {
+                        debugLog = it
+                        prefs.edit().putBoolean("debugLog", it).apply()
+                    }
+                )
+                Text(text = "启用 debugLog")
+            }
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = enableCache, onCheckedChange = { enableCache = it })
                 Text(text = "启用解包缓存")
@@ -230,6 +285,9 @@ class MainActivity : ComponentActivity() {
                                     val enableIo = enableIoRedirect
                                     val enableMaps = enableMapsHide
                                     val enableRes = enableResourceRedirect
+                                    val dbg = debugLog
+                                    val mode = hookMode
+                                    val deepHide = enableDeepHide
                                     val cache = enableCache
                                     val payloadCache = enablePayloadDexCache
 
@@ -239,6 +297,9 @@ class MainActivity : ComponentActivity() {
                                         enableIoRedirect = enableIo
                                         enableMapsHide = enableMaps
                                         enableResourceRedirect = enableRes
+                                        debugLog = dbg
+                                        hookMode = mode
+                                        enableDeepHide = deepHide
                                         enableCache = cache
                                         enablePayloadDexCache = payloadCache
                                     }

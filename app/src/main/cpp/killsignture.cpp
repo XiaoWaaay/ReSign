@@ -27,6 +27,12 @@
 #include <sys/uio.h>
 #include <stdarg.h>
 
+#if defined(RESIG_HAS_DOBBY)
+extern "C" int DobbyHook(void* function_address, void* replace_call, void** origin_call);
+#else
+extern "C" int DobbyHook(void*, void*, void**) { return -1; }
+#endif
+
 // ===== 日志（避免在信号处理器里使用 LOG*）=====
 #define TAG "resig-native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -43,6 +49,9 @@
 #endif
 #ifndef PR_SET_NO_NEW_PRIVS
 # define PR_SET_NO_NEW_PRIVS 38
+#endif
+#ifndef PR_GET_NO_NEW_PRIVS
+# define PR_GET_NO_NEW_PRIVS 39
 #endif
 #ifndef PR_SET_SECCOMP
 # define PR_SET_SECCOMP 22
@@ -146,6 +155,8 @@ static const char* g_rep_path = nullptr;  // 替换 APK
 
 static uintptr_t g_self_map_start = 0;
 static uintptr_t g_self_map_end_inclusive = 0;
+static uintptr_t g_libc_map_start = 0;
+static uintptr_t g_libc_map_end_inclusive = 0;
 
 static __thread int g_in_sigsys_handler = 0;
 
@@ -170,11 +181,14 @@ static inline void unmark_redirected_fd(int fd);
 
 enum RedirectBackend {
   REDIRECT_BACKEND_NONE = 0,
+  REDIRECT_BACKEND_DOBBY = 1,
   REDIRECT_BACKEND_SECCOMP_SIGSYS = 2,
+  REDIRECT_BACKEND_HYBRID = 3,
 };
 
 static int g_redirect_backend = REDIRECT_BACKEND_NONE;
-static volatile int g_maps_hide_enabled = 1;
+static volatile int g_maps_hide_enabled = 0;
+static volatile int g_seccomp_full_enabled = 0;
 
 using OpenFn = int (*)(const char *, int, ...);
 using OpenatFn = int (*)(int, const char *, int, ...);
@@ -188,6 +202,18 @@ using LstatFn = int (*)(const char*, struct stat*);
 using NewfstatatFn = int (*)(int, const char*, struct stat*, int);
 using StatxFn = int (*)(int, const char*, int, unsigned int, void*);
 
+static int open_hook(const char *pathname, int flags, ...);
+static int openat_hook(int dirfd, const char *pathname, int flags, ...);
+static int openat2_hook(int dirfd, const char* pathname, const void* how, size_t size);
+static ssize_t readlink_hook(const char *pathname, char *buf, size_t bufsiz);
+static ssize_t readlinkat_hook(int dirfd, const char *pathname, char *buf, size_t bufsiz);
+static int access_hook(const char* pathname, int mode);
+static int faccessat_hook(int dirfd, const char* pathname, int mode, int flags);
+static int stat_hook(const char* pathname, struct stat* st);
+static int lstat_hook(const char* pathname, struct stat* st);
+static int newfstatat_hook(int dirfd, const char* pathname, struct stat* st, int flags);
+static int statx_hook(int dirfd, const char* pathname, int flags, unsigned int mask, void* buf);
+
 static OpenFn g_orig_open = nullptr;
 static OpenatFn g_orig_openat = nullptr;
 static Openat2Fn g_orig_openat2 = nullptr;
@@ -199,6 +225,46 @@ static StatFn g_orig_stat = nullptr;
 static LstatFn g_orig_lstat = nullptr;
 static NewfstatatFn g_orig_newfstatat = nullptr;
 static StatxFn g_orig_statx = nullptr;
+
+static volatile int g_dobby_inited = 0;
+
+static void* resolve_sym(const char* name) {
+  if (!name || name[0] == '\0') return nullptr;
+  void* p = dlsym(RTLD_NEXT, name);
+  if (!p) p = dlsym(RTLD_DEFAULT, name);
+  return p;
+}
+
+static void dobby_hook_symbol(const char* name, void* replace, void** origin_out) {
+  void* target = resolve_sym(name);
+  if (!target) return;
+  if (DobbyHook(target, replace, origin_out) != 0) return;
+}
+
+static void install_dobby_backend_best_effort() {
+#if !defined(RESIG_HAS_DOBBY)
+  return;
+#else
+  int expected = 0;
+  if (!__atomic_compare_exchange_n(&g_dobby_inited, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
+
+  int full = __atomic_load_n(&g_seccomp_full_enabled, __ATOMIC_RELAXED) != 0;
+  dobby_hook_symbol("open", (void*)open_hook, (void**)&g_orig_open);
+  dobby_hook_symbol("openat", (void*)openat_hook, (void**)&g_orig_openat);
+  dobby_hook_symbol("openat2", (void*)openat2_hook, (void**)&g_orig_openat2);
+  dobby_hook_symbol("readlink", (void*)readlink_hook, (void**)&g_orig_readlink);
+  dobby_hook_symbol("readlinkat", (void*)readlinkat_hook, (void**)&g_orig_readlinkat);
+  if (full) {
+    dobby_hook_symbol("faccessat", (void*)faccessat_hook, (void**)&g_orig_faccessat);
+    dobby_hook_symbol("stat", (void*)stat_hook, (void**)&g_orig_stat);
+    dobby_hook_symbol("lstat", (void*)lstat_hook, (void**)&g_orig_lstat);
+    dobby_hook_symbol("newfstatat", (void*)newfstatat_hook, (void**)&g_orig_newfstatat);
+    dobby_hook_symbol("statx", (void*)statx_hook, (void**)&g_orig_statx);
+  }
+
+  g_redirect_backend = REDIRECT_BACKEND_DOBBY;
+#endif
+}
 
 static inline int should_redirect_path(const char *pathname) {
   if (!pathname || !g_rep_path) return 0;
@@ -242,6 +308,10 @@ static int open_hook(const char *pathname, int flags, ...) {
   int did_redirect = 0;
   const char *p = maybe_redirect_path(pathname, &did_redirect);
 
+  if (did_redirect && g_dbg_enabled && pathname && p) {
+    LOGI("redirect open: %s -> %s", pathname, p);
+  }
+
   int fd;
   if (flags & O_CREAT) {
     fd = g_orig_open ? g_orig_open(p, flags, mode) : -1;
@@ -267,6 +337,10 @@ static int openat_hook(int dirfd, const char *pathname, int flags, ...) {
   int did_redirect = 0;
   const char *p = maybe_redirect_path(pathname, &did_redirect);
 
+  if (did_redirect && g_dbg_enabled && pathname && p) {
+    LOGI("redirect openat: %s -> %s", pathname, p);
+  }
+
   int fd;
   if (flags & O_CREAT) {
     fd = g_orig_openat ? g_orig_openat(dirfd, p, flags, mode) : -1;
@@ -283,6 +357,9 @@ static int openat_hook(int dirfd, const char *pathname, int flags, ...) {
 static int openat2_hook(int dirfd, const char* pathname, const void* how, size_t size) {
   int did_redirect = 0;
   const char* p = maybe_redirect_path(pathname, &did_redirect);
+  if (did_redirect && g_dbg_enabled && pathname && p) {
+    LOGI("redirect openat2: %s -> %s", pathname, p);
+  }
   int fd = g_orig_openat2 ? g_orig_openat2(dirfd, p, how, size) : -1;
   if (fd >= 0 && (did_redirect || (p && g_rep_path && c_ends_with(p, g_rep_path)))) {
     mark_redirected_fd(fd);
@@ -721,6 +798,62 @@ static int find_self_map_range(uintptr_t* out_start, uintptr_t* out_end_inclusiv
    return 0;
 }
 
+static int find_libc_map_range(uintptr_t* out_start, uintptr_t* out_end_inclusive) {
+  if (!out_start || !out_end_inclusive) return -1;
+
+  struct Ctx {
+    uintptr_t min_start;
+    uintptr_t max_end;
+    int found;
+  };
+
+  Ctx ctx;
+  memset(&ctx, 0, sizeof(ctx));
+
+  int (*cb)(struct dl_phdr_info*, size_t, void*) = [](struct dl_phdr_info* i, size_t, void* data) -> int {
+    Ctx* c = (Ctx*)data;
+    const char* name = i->dlpi_name;
+    if (!name || name[0] == '\0') return 0;
+    const char* base = c_basename(name);
+    if (!base || base[0] == '\0') return 0;
+    if (strstr(base, "libc.so") == nullptr) return 0;
+
+    uintptr_t min_start = 0;
+    uintptr_t max_end = 0;
+    int found = 0;
+    for (int p = 0; p < i->dlpi_phnum; ++p) {
+      const ElfW(Phdr)& ph = i->dlpi_phdr[p];
+      if (ph.p_type != PT_LOAD) continue;
+      uintptr_t start = (uintptr_t)i->dlpi_addr + (uintptr_t)ph.p_vaddr;
+      uintptr_t end = start + (uintptr_t)ph.p_memsz;
+      if (!found) {
+        min_start = start;
+        max_end = end;
+        found = 1;
+      } else {
+        if (start < min_start) min_start = start;
+        if (end > max_end) max_end = end;
+      }
+    }
+
+    if (found && max_end > min_start) {
+      c->min_start = min_start;
+      c->max_end = max_end;
+      c->found = 1;
+      return 1;
+    }
+    return 0;
+  };
+
+  (void)dl_iterate_phdr(cb, &ctx);
+  if (ctx.found && ctx.max_end > ctx.min_start) {
+    *out_start = ctx.min_start;
+    *out_end_inclusive = ctx.max_end - 1;
+    return 0;
+  }
+  return -1;
+}
+
 static inline long raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
 #if defined(__aarch64__)
    register long x8 __asm__("x8") = n;
@@ -813,21 +946,37 @@ static inline void dbg_write_line_78_target(const char* target) {
    (void)raw_syscall6((long)kSysWrite, (long)g_dbg_pipe_w, (long)msg, (long)p, 0, 0, 0);
 }
 
-static int install_seccomp_filter_all_threads() {
-   if (g_self_map_start == 0 || g_self_map_end_inclusive == 0 || g_self_map_end_inclusive < g_self_map_start) {
-       LOGE("self map range not ready");
-       return -1;
-   }
+static int install_seccomp_filter_all_threads(uintptr_t ip_start, uintptr_t ip_end_inclusive) {
+  if (ip_start == 0 || ip_end_inclusive == 0 || ip_end_inclusive < ip_start) {
+      LOGE("ip range not ready");
+      return -1;
+  }
 
-   const uint64_t start = (uint64_t)g_self_map_start;
-   const uint64_t end = (uint64_t)g_self_map_end_inclusive;
-   const uint32_t start_lo = (uint32_t)(start & 0xffffffffULL);
-   const uint32_t start_hi = (uint32_t)((start >> 32) & 0xffffffffULL);
-   const uint32_t end_lo = (uint32_t)(end & 0xffffffffULL);
-   const uint32_t end_hi = (uint32_t)((end >> 32) & 0xffffffffULL);
-   const uint32_t ip_off = (uint32_t)offsetof(struct seccomp_data, instruction_pointer);
+  const uint64_t start = (uint64_t)ip_start;
+  const uint64_t end = (uint64_t)ip_end_inclusive;
+  const uint32_t start_lo = (uint32_t)(start & 0xffffffffULL);
+  const uint32_t start_hi = (uint32_t)((start >> 32) & 0xffffffffULL);
+  const uint32_t end_lo = (uint32_t)(end & 0xffffffffULL);
+  const uint32_t end_hi = (uint32_t)((end >> 32) & 0xffffffffULL);
+  const uint32_t ip_off = (uint32_t)offsetof(struct seccomp_data, instruction_pointer);
 
-  struct sock_filter filter_same_hi[] = {
+  struct sock_filter filter_same_hi_min[] = {
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 3, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat2, 2, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 1, 0),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 4),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, start_hi, 0, 4),
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 0),
+           BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, start_lo, 0, 2),
+           BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, end_lo, 1, 0),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+   };
+
+  struct sock_filter filter_same_hi_full[] = {
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 6, 0),
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat2, 5, 0),
@@ -846,7 +995,28 @@ static int install_seccomp_filter_all_threads() {
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
    };
 
-  struct sock_filter filter_diff_hi[] = {
+  struct sock_filter filter_diff_hi_min[] = {
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 3, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat2, 2, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 1, 0),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 4),
+           BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, start_hi, 0, 9),
+           BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, end_hi, 8, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, start_hi, 0, 3),
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 0),
+           BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, start_lo, 0, 5),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, end_hi, 0, 2),
+           BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, ip_off + 0),
+           BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, end_lo, 1, 0),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+           BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+   };
+
+  struct sock_filter filter_diff_hi_full[] = {
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 6, 0),
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat2, 5, 0),
@@ -872,21 +1042,27 @@ static int install_seccomp_filter_all_threads() {
 
    struct sock_filter* filter = nullptr;
    size_t filter_len = 0;
+   int full = __atomic_load_n(&g_seccomp_full_enabled, __ATOMIC_RELAXED) != 0;
    if (start_hi == end_hi) {
-       filter = filter_same_hi;
-       filter_len = sizeof(filter_same_hi) / sizeof(filter_same_hi[0]);
+       filter = full ? filter_same_hi_full : filter_same_hi_min;
+       filter_len = full ? (sizeof(filter_same_hi_full) / sizeof(filter_same_hi_full[0]))
+                         : (sizeof(filter_same_hi_min) / sizeof(filter_same_hi_min[0]));
    } else {
-       filter = filter_diff_hi;
-       filter_len = sizeof(filter_diff_hi) / sizeof(filter_diff_hi[0]);
+       filter = full ? filter_diff_hi_full : filter_diff_hi_min;
+       filter_len = full ? (sizeof(filter_diff_hi_full) / sizeof(filter_diff_hi_full[0]))
+                         : (sizeof(filter_diff_hi_min) / sizeof(filter_diff_hi_min[0]));
    }
 
    struct sock_fprog prog;
    prog.len    = (unsigned short)filter_len;
    prog.filter = filter;
 
-   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-       LOGE("PR_SET_NO_NEW_PRIVS failed");
-       return -1;
+   int no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+   if (no_new_privs != 1) {
+       if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+           LOGE("PR_SET_NO_NEW_PRIVS failed: %d", errno);
+           return -1;
+       }
    }
 
 #if defined(SYS_seccomp)
@@ -990,6 +1166,7 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
                && pathname[0] != '\0'
                && c_has_prefix(pathname, "/proc/")
                && c_ends_with(pathname, "/maps")
+               && __atomic_load_n(&g_maps_hide_enabled, __ATOMIC_RELAXED) != 0
                && kSysMemfdCreate != kSysInvalid
                && kSysRead != kSysInvalid
                && kSysClose != kSysInvalid
@@ -1192,7 +1369,7 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
   Java_com_xwaaa_hook_HookApplication_hookApkPathWithBackend(env, nullptr, jSourcePath, jRepPath, 0);
 }
 
-static void install_seccomp_backend_best_effort() {
+static void install_seccomp_backend_best_effort(int final_backend) {
   if (find_self_map_range(&g_self_map_start, &g_self_map_end_inclusive) != 0) {
     LOGE("find_self_map_range failed");
   }
@@ -1205,7 +1382,7 @@ static void install_seccomp_backend_best_effort() {
     LOGE("install_seccomp_filter_all_threads failed");
   }
 
-  g_redirect_backend = REDIRECT_BACKEND_SECCOMP_SIGSYS;
+  g_redirect_backend = final_backend;
 }
 
 extern "C"
@@ -1234,7 +1411,22 @@ Java_com_xwaaa_hook_HookApplication_hookApkPathWithBackend(
        return;
    }
 
-  install_seccomp_backend_best_effort();
+  int b = (int)backend;
+#if !defined(RESIG_HAS_DOBBY)
+  if (b == REDIRECT_BACKEND_DOBBY || b == REDIRECT_BACKEND_HYBRID) {
+      b = REDIRECT_BACKEND_SECCOMP_SIGSYS;
+  }
+#endif
+  if (b == REDIRECT_BACKEND_DOBBY) {
+      install_dobby_backend_best_effort();
+  } else if (b == REDIRECT_BACKEND_HYBRID) {
+      install_dobby_backend_best_effort();
+      install_seccomp_backend_best_effort(REDIRECT_BACKEND_HYBRID);
+  } else if (b == REDIRECT_BACKEND_SECCOMP_SIGSYS) {
+      install_seccomp_backend_best_effort(REDIRECT_BACKEND_SECCOMP_SIGSYS);
+  } else {
+      install_seccomp_backend_best_effort(REDIRECT_BACKEND_SECCOMP_SIGSYS);
+  }
 
   env->ReleaseStringUTFChars(jSourcePath, src);
   env->ReleaseStringUTFChars(jRepPath, rep);
@@ -1247,6 +1439,25 @@ Java_com_xwaaa_hook_HookApplication_cleanup(JNIEnv*, jclass) {
    if (g_apk_path) { free((void*)g_apk_path); g_apk_path = nullptr; }
    if (g_rep_path) { free((void*)g_rep_path); g_rep_path = nullptr; }
    // 管道/线程可按需收尾；通常进程退出由内核清理
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_xwaaa_hook_HookApplication_setMapsHideEnabled(JNIEnv*, jclass, jboolean enabled) {
+  __atomic_store_n(&g_maps_hide_enabled, enabled ? 1 : 0, __ATOMIC_RELAXED);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_xwaaa_hook_HookApplication_setSeccompFullEnabled(JNIEnv*, jclass, jboolean enabled) {
+  __atomic_store_n(&g_seccomp_full_enabled, enabled ? 1 : 0, __ATOMIC_RELAXED);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_xwaaa_hook_HookApplication_setNativeDebugEnabled(JNIEnv*, jclass, jboolean enabled) {
+  g_dbg_enabled = enabled ? 1 : 0;
+  if (g_dbg_enabled) start_dbg_logger_once();
 }
 
 extern "C"
@@ -1276,7 +1487,7 @@ Java_com_xwaaa_resig_NativeRedirector_installRedirect(JNIEnv* env, jclass, jstri
   env->ReleaseStringUTFChars(jRepPath, rep);
 
   g_self_pid = getpid();
-  install_seccomp_backend_best_effort();
+  install_seccomp_backend_best_effort(REDIRECT_BACKEND_SECCOMP_SIGSYS);
   return JNI_TRUE;
 }
 

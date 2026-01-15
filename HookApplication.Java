@@ -70,12 +70,14 @@ public class HookApplication extends Application {
     private static final AtomicBoolean PM_HOOKED = new AtomicBoolean(false);
     private static final AtomicBoolean PINE_INITED = new AtomicBoolean(false);
     private static final AtomicBoolean NATIVE_INITED = new AtomicBoolean(false);
+    private static final AtomicBoolean EARLY_HOOK_INITED = new AtomicBoolean(false);
 
     private static final ConcurrentHashMap<String, Boolean> HOOKED_METHODS = new ConcurrentHashMap<>();
 
     private static volatile Signature sFakeSig;
     private static volatile X509Certificate sFakeCert;
     private static volatile int sTargetUid = -1;
+    private static volatile String sOriginApkPath;
 
     private static final String LIB_NAME = "killsignture";
 
@@ -87,18 +89,55 @@ public class HookApplication extends Application {
 
     private static native void setMapsHideEnabled(boolean enabled);
 
+    private static native void setSeccompFullEnabled(boolean enabled);
+
+    private static native void setNativeDebugEnabled(boolean enabled);
+
     private static volatile Application sDelegateApp;
     private static volatile Object sDelegateFactory;
+
+    private enum HookMode {
+        SAFE,
+        STANDARD,
+        AGGRESSIVE
+    }
+
+    private static volatile HookMode sHookMode = HookMode.STANDARD;
+
+    private static final String META_DEBUG_LOG = "resig.debugLog";
+    private static final String META_HOOK_MODE = "resig.hookMode";
+    private static final String META_ENABLE_DEEP_HIDE = "resig.enableDeepHide";
+    private static final String META_ENABLE_MAPS_HIDE = "resig.enableMapsHide";
+    private static final String META_ENABLE_NATIVE_HOOK = "resig.enableNativeHook";
+    private static final String META_ENABLE_IO_REDIRECT = "resig.enableIoRedirect";
+    private static final String META_NATIVE_BACKEND = "resig.nativeBackend";
+
+    private static final String CRASH_STATE_FILE = "resig_crash_state";
+
+    static {
+        try {
+            initPineStatic();
+            installEarlyJavaHooksBestEffort();
+        } catch (Throwable ignored) {
+        }
+    }
 
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
-        log("attachBaseContext: " + base.getPackageName());
+        HookMode desired = readHookMode(base);
+        sHookMode = applyCrashDowngradeIfNeeded(base, desired);
 
-        initPine();
+        boolean debugLog = getBooleanMeta(base, META_DEBUG_LOG, false);
+        initPine(debugLog);
+        log("attachBaseContext: " + base.getPackageName() + " mode=" + sHookMode);
+
         initSignatureData(base);
         initHooks(base);
         handleDelegateAttach(base);
+        if (shouldEnableDeepHide(base)) {
+            hideDeepTraces(base);
+        }
         hideManifestTraces(base);
     }
 
@@ -108,27 +147,46 @@ public class HookApplication extends Application {
         log("onCreate");
 
         if (sDelegateApp != null) {
-            hideDeepTraces(getBaseContext());
+            if (shouldEnableDeepHide(getBaseContext())) {
+                hideDeepTraces(getBaseContext());
+            }
             log("Calling delegate onCreate: " + sDelegateApp.getClass().getName());
             sDelegateApp.onCreate();
-            hideDeepTraces(getBaseContext());
+            if (shouldEnableDeepHide(getBaseContext())) {
+                hideDeepTraces(getBaseContext());
+            }
         }
     }
 
-    private void initPine() {
+    private void initPine(boolean debugLog) {
+        PineConfig.debug = debugLog;
+        PineConfig.debuggable = true;
+        PineConfig.disableHiddenApiPolicy = true;
+        PineConfig.disableHiddenApiPolicyForPlatformDomain = true;
+        PineConfig.antiChecks = true;
+
         if (PINE_INITED.compareAndSet(false, true)) {
             try {
-                PineConfig.debug = true;
-                PineConfig.debuggable = true;
-                PineConfig.disableHiddenApiPolicy = true;
-                PineConfig.disableHiddenApiPolicyForPlatformDomain = true;
-                PineConfig.antiChecks = true;
-
                 Pine.ensureInitialized();
                 Pine.disableHiddenApiPolicy(true, true);
             } catch (Throwable e) {
                 Log.e(TAG, "Pine init failed", e);
             }
+        }
+    }
+
+    private static void initPineStatic() {
+        if (!PINE_INITED.compareAndSet(false, true)) return;
+        try {
+            PineConfig.debug = false;
+            PineConfig.debuggable = true;
+            PineConfig.disableHiddenApiPolicy = true;
+            PineConfig.disableHiddenApiPolicyForPlatformDomain = true;
+            PineConfig.antiChecks = true;
+
+            Pine.ensureInitialized();
+            Pine.disableHiddenApiPolicy(true, true);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -166,6 +224,11 @@ public class HookApplication extends Application {
     private void initHooks(Context context) {
         if (!INIT_ONCE.compareAndSet(false, true)) return;
 
+        try {
+            installEarlyJavaHooksBestEffort();
+        } catch (Throwable ignored) {
+        }
+
         if (sFakeSig != null) {
             boolean success = installPackageManagerHooks(context);
             PM_HOOKED.set(success);
@@ -179,8 +242,8 @@ public class HookApplication extends Application {
         if (!NATIVE_INITED.compareAndSet(false, true)) return;
         if (context == null) return;
 
-        boolean enableNativeHook = getBooleanMeta(context, "resig.enableNativeHook", true);
-        boolean enableIoRedirect = getBooleanMeta(context, "resig.enableIoRedirect", true);
+        boolean enableNativeHook = getBooleanMeta(context, META_ENABLE_NATIVE_HOOK, true);
+        boolean enableIoRedirect = getBooleanMeta(context, META_ENABLE_IO_REDIRECT, true);
         if (!enableNativeHook || !enableIoRedirect) return;
 
         try {
@@ -188,6 +251,12 @@ public class HookApplication extends Application {
         } catch (Throwable t) {
             Log.e(TAG, "Load native library failed: " + LIB_NAME, t);
             return;
+        }
+
+        try {
+            boolean debugLog = getBooleanMeta(context, META_DEBUG_LOG, false);
+            setNativeDebugEnabled(debugLog);
+        } catch (Throwable ignored) {
         }
 
         String sourceApkPath = null;
@@ -201,14 +270,20 @@ public class HookApplication extends Application {
 
         File repFile = ensureOriginApkExtracted(context);
         if (repFile == null || !repFile.exists() || repFile.length() <= 0) return;
+        sOriginApkPath = repFile.getAbsolutePath();
 
         try {
-            boolean enableMapsHide = getBooleanMeta(context, "resig.enableMapsHide", true);
+            int backend = resolveNativeBackend(context, sHookMode);
+            boolean enableMapsHide = shouldEnableMapsHide(context, sHookMode);
             try {
                 setMapsHideEnabled(enableMapsHide);
             } catch (Throwable ignored) {
             }
-            hookApkPath(sourceApkPath, repFile.getAbsolutePath());
+            try {
+                setSeccompFullEnabled(sHookMode == HookMode.AGGRESSIVE);
+            } catch (Throwable ignored) {
+            }
+            hookApkPathWithBackend(sourceApkPath, repFile.getAbsolutePath(), backend);
             log("Native hook installed. backend=" + getRedirectBackend());
         } catch (Throwable t) {
             Log.e(TAG, "Native hook install failed", t);
@@ -252,10 +327,171 @@ public class HookApplication extends Application {
                 }
             }
 
-            Log.d(TAG, "Traces hidden: className restored to " + appInfo.className);
+            log("Traces hidden: className restored to " + appInfo.className);
         } catch (Throwable e) {
             Log.e(TAG, "Failed to hide traces", e);
         }
+    }
+
+    private static HookMode readHookMode(Context context) {
+        String mode = getStringMeta(context, META_HOOK_MODE, "standard");
+        if (mode == null) return HookMode.STANDARD;
+        String m = mode.trim().toLowerCase();
+        if (m.equals("safe") || m.equals("mode_safe")) return HookMode.SAFE;
+        if (m.equals("aggressive") || m.equals("mode_aggressive") || m.equals("strong")) return HookMode.AGGRESSIVE;
+        return HookMode.STANDARD;
+    }
+
+    private static int resolveNativeBackend(Context context, HookMode mode) {
+        String v = getStringMeta(context, META_NATIVE_BACKEND, null);
+        if (v != null) {
+            String s = v.trim().toLowerCase();
+            if (s.equals("dobby") || s.equals("plt")) return 1;
+            if (s.equals("seccomp") || s.equals("sigsys")) return 2;
+            if (s.equals("hybrid")) return 3;
+            int asInt = getIntMeta(context, META_NATIVE_BACKEND, -1);
+            if (asInt >= 0) return asInt;
+        }
+        if (mode == HookMode.SAFE) return 1;
+        if (mode == HookMode.AGGRESSIVE) return 3;
+        return 3;
+    }
+
+    private static boolean shouldEnableMapsHide(Context context, HookMode mode) {
+        boolean manifest = getBooleanMeta(context, META_ENABLE_MAPS_HIDE, false);
+        return manifest && mode == HookMode.AGGRESSIVE;
+    }
+
+    private static boolean shouldEnableDeepHide(Context context) {
+        if (context == null) return false;
+        if (sHookMode == HookMode.SAFE) return false;
+        return getBooleanMeta(context, META_ENABLE_DEEP_HIDE, true);
+    }
+
+    private static HookMode applyCrashDowngradeIfNeeded(Context context, HookMode desired) {
+        if (context == null) return desired;
+        File state = new File(context.getFilesDir(), CRASH_STATE_FILE);
+        long now = System.currentTimeMillis();
+
+        long lastStart = 0;
+        int crashCount = 0;
+        long lastStable = 0;
+
+        try {
+            if (state.exists()) {
+                BufferedReader r = new BufferedReader(new FileReader(state));
+                try {
+                    String line = r.readLine();
+                    if (line != null) {
+                        String[] parts = line.trim().split(",");
+                        if (parts.length >= 1) lastStart = Long.parseLong(parts[0]);
+                        if (parts.length >= 2) crashCount = Integer.parseInt(parts[1]);
+                        if (parts.length >= 3) lastStable = Long.parseLong(parts[2]);
+                    }
+                } finally {
+                    try {
+                        r.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (lastStart > 0 && lastStable < lastStart && now - lastStart <= 5000L) {
+            crashCount++;
+        } else if (now - lastStable > 60_000L) {
+            crashCount = 0;
+        }
+
+        try {
+            FileOutputStream os = new FileOutputStream(state, false);
+            try {
+                String out = now + "," + crashCount + "," + lastStable;
+                os.write(out.getBytes("UTF-8"));
+                os.flush();
+                try {
+                    os.getFD().sync();
+                } catch (Throwable ignored) {
+                }
+            } finally {
+                try {
+                    os.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            final File stateFile = state;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(30_000L);
+                    } catch (Throwable ignored) {
+                    }
+                    try {
+                        long stableNow = System.currentTimeMillis();
+                        FileOutputStream os = new FileOutputStream(stateFile, false);
+                        try {
+                            String out = now + ",0," + stableNow;
+                            os.write(out.getBytes("UTF-8"));
+                            os.flush();
+                            try {
+                                os.getFD().sync();
+                            } catch (Throwable ignored) {
+                            }
+                        } finally {
+                            try {
+                                os.close();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, "resig-crash-guard").start();
+        } catch (Throwable ignored) {
+        }
+
+        if (crashCount > 2) return HookMode.SAFE;
+        return desired;
+    }
+
+    private static String getStringMeta(Context context, String key, String defValue) {
+        try {
+            ApplicationInfo ai = context.getPackageManager().getApplicationInfo(
+                    context.getPackageName(),
+                    PackageManager.GET_META_DATA
+            );
+            if (ai != null && ai.metaData != null && ai.metaData.containsKey(key)) {
+                Object v = ai.metaData.get(key);
+                if (v instanceof String) return (String) v;
+                if (v instanceof Boolean) return ((Boolean) v) ? "true" : "false";
+                if (v instanceof Integer) return String.valueOf(v);
+            }
+        } catch (Throwable ignored) {
+        }
+        return defValue;
+    }
+
+    private static int getIntMeta(Context context, String key, int defValue) {
+        try {
+            ApplicationInfo ai = context.getPackageManager().getApplicationInfo(
+                    context.getPackageName(),
+                    PackageManager.GET_META_DATA
+            );
+            if (ai != null && ai.metaData != null && ai.metaData.containsKey(key)) {
+                Object v = ai.metaData.get(key);
+                if (v instanceof Integer) return (Integer) v;
+                if (v instanceof String) return Integer.parseInt((String) v);
+                if (v instanceof Boolean) return ((Boolean) v) ? 1 : 0;
+            }
+        } catch (Throwable ignored) {
+        }
+        return defValue;
     }
 
     /**
@@ -657,6 +893,287 @@ public class HookApplication extends Application {
         }
     }
 
+    private static void safeHookStatic(Method method, MethodHook hook) {
+        if (method == null) return;
+        String key = method.getDeclaringClass().getName() + "#" + method.getName() + Arrays.toString(method.getParameterTypes());
+        if (HOOKED_METHODS.containsKey(key)) return;
+        try {
+            Pine.hook(method, hook);
+            HOOKED_METHODS.put(key, true);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void installEarlyJavaHooksBestEffort() {
+        if (!EARLY_HOOK_INITED.compareAndSet(false, true)) return;
+
+        try {
+            Field creatorField = PackageInfo.class.getField("CREATOR");
+            Object creator = creatorField.get(null);
+            if (creator != null) {
+                Method createFromParcel = creator.getClass().getMethod("createFromParcel", Parcel.class);
+                safeHookStatic(createFromParcel, new MethodHook() {
+                    @Override
+                    public void afterCall(Pine.CallFrame callFrame) {
+                        Object result = callFrame.getResult();
+                        if (!(result instanceof PackageInfo)) return;
+                        PackageInfo pi = (PackageInfo) result;
+                        if (sFakeSig == null) return;
+                        if (pi.packageName != null && pi.packageName.equals(packageName)) {
+                            patchPackageInfoStatic(pi);
+                        }
+                    }
+                });
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                Class<?> signingInfoClass = Class.forName("android.content.pm.SigningInfo");
+                Field creatorField = signingInfoClass.getField("CREATOR");
+                Object creator = creatorField.get(null);
+                if (creator != null) {
+                    Method createFromParcel = creator.getClass().getMethod("createFromParcel", Parcel.class);
+                    safeHookStatic(createFromParcel, new MethodHook() {
+                        @Override
+                        public void afterCall(Pine.CallFrame callFrame) {
+                            Object result = callFrame.getResult();
+                            if (result == null) return;
+                            if (sFakeSig == null) return;
+                            patchSigningInfoStatic(result);
+                        }
+                    });
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        try {
+            Class<?> apm = Class.forName("android.app.ApplicationPackageManager");
+            hookMethodsInPackageManagerStatic(apm);
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            installPackageResourcePathHookBestEffort();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void installPackageResourcePathHookBestEffort() {
+        try {
+            Method m = ContextWrapper.class.getMethod("getPackageResourcePath");
+            safeHookStatic(m, new MethodHook() {
+                @Override
+                public void afterCall(Pine.CallFrame callFrame) {
+                    maybeOverrideApkPathResult(callFrame);
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Method m = ContextWrapper.class.getMethod("getPackageCodePath");
+            safeHookStatic(m, new MethodHook() {
+                @Override
+                public void afterCall(Pine.CallFrame callFrame) {
+                    maybeOverrideApkPathResult(callFrame);
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Class<?> ctxImpl = Class.forName("android.app.ContextImpl");
+            Method m = ctxImpl.getDeclaredMethod("getPackageResourcePath");
+            safeHookStatic(m, new MethodHook() {
+                @Override
+                public void afterCall(Pine.CallFrame callFrame) {
+                    maybeOverrideApkPathResult(callFrame);
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Class<?> ctxImpl = Class.forName("android.app.ContextImpl");
+            Method m = ctxImpl.getDeclaredMethod("getPackageCodePath");
+            safeHookStatic(m, new MethodHook() {
+                @Override
+                public void afterCall(Pine.CallFrame callFrame) {
+                    maybeOverrideApkPathResult(callFrame);
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void maybeOverrideApkPathResult(Pine.CallFrame callFrame) {
+        if (callFrame == null) return;
+        String rep = sOriginApkPath;
+        if (rep == null || rep.isEmpty()) return;
+        try {
+            File f = new File(rep);
+            if (!f.exists() || f.length() <= 0) return;
+        } catch (Throwable ignored) {
+            return;
+        }
+
+        Object r;
+        try {
+            r = callFrame.getResult();
+        } catch (Throwable t) {
+            return;
+        }
+        if (!(r instanceof String)) return;
+        String cur = (String) r;
+        if (cur == null || cur.isEmpty()) return;
+        if (!cur.endsWith(".apk")) return;
+        if (!cur.contains("/base.apk") && !cur.equals(rep)) return;
+
+        try {
+            Method setResult = callFrame.getClass().getMethod("setResult", Object.class);
+            setResult.invoke(callFrame, rep);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void hookMethodsInPackageManagerStatic(Class<?> pmClass) {
+        if (pmClass == null) return;
+        Set<String> targetMethods = new HashSet<>(Arrays.asList(
+                "getPackageInfo",
+                "getPackageInfoAsUser",
+                "getInstalledPackages",
+                "getInstalledPackagesAsUser",
+                "getPackageArchiveInfo"
+        ));
+
+        Method[] methods = pmClass.getDeclaredMethods();
+        List<Method> allMethods = new ArrayList<>(Arrays.asList(methods));
+        try {
+            allMethods.addAll(Arrays.asList(pmClass.getMethods()));
+        } catch (Throwable ignored) {
+        }
+
+        for (Method method : allMethods) {
+            String name = method.getName();
+            if (!targetMethods.contains(name)) continue;
+            if (method.isBridge() || method.isSynthetic()) continue;
+
+            if (name.startsWith("getPackageInfo")) {
+                Class<?>[] params = method.getParameterTypes();
+                if (method.getReturnType() != PackageInfo.class) continue;
+                if (params.length > 0 && params[0] == String.class) {
+                    safeHookStatic(method, new MethodHook() {
+                        @Override
+                        public void afterCall(Pine.CallFrame callFrame) throws Throwable {
+                            Object result = callFrame.getResult();
+                            if (!(result instanceof PackageInfo)) return;
+                            if (sFakeSig == null) return;
+                            PackageInfo pi = (PackageInfo) result;
+                            String reqPkg = null;
+                            if (callFrame.args.length > 0 && callFrame.args[0] instanceof String) {
+                                reqPkg = (String) callFrame.args[0];
+                            }
+                            if ((reqPkg != null && reqPkg.equals(packageName)) || (pi.packageName != null && pi.packageName.equals(packageName))) {
+                                patchPackageInfoStatic(pi);
+                            }
+                        }
+                    });
+                }
+            } else if (name.startsWith("getInstalledPackages")) {
+                if (method.getReturnType() == List.class) {
+                    safeHookStatic(method, new MethodHook() {
+                        @Override
+                        public void afterCall(Pine.CallFrame callFrame) throws Throwable {
+                            Object result = callFrame.getResult();
+                            if (!(result instanceof List)) return;
+                            if (sFakeSig == null) return;
+                            List<?> list = (List<?>) result;
+                            for (Object o : list) {
+                                if (o instanceof PackageInfo) {
+                                    PackageInfo pi = (PackageInfo) o;
+                                    if (pi.packageName != null && pi.packageName.equals(packageName)) {
+                                        patchPackageInfoStatic(pi);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            } else if (name.equals("getPackageArchiveInfo")) {
+                if (method.getReturnType() == PackageInfo.class) {
+                    safeHookStatic(method, new MethodHook() {
+                        @Override
+                        public void afterCall(Pine.CallFrame callFrame) {
+                            Object result = callFrame.getResult();
+                            if (!(result instanceof PackageInfo)) return;
+                            if (sFakeSig == null) return;
+                            patchPackageInfoStatic((PackageInfo) result);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    private static void patchPackageInfoStatic(PackageInfo pi) {
+        if (pi == null || sFakeSig == null) return;
+        if (pi.signatures != null && pi.signatures.length > 0) {
+            pi.signatures[0] = sFakeSig;
+            for (int i = 1; i < pi.signatures.length; i++) {
+                pi.signatures[i] = sFakeSig;
+            }
+        } else {
+            pi.signatures = new Signature[]{sFakeSig};
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            if (pi.signingInfo != null) {
+                patchSigningInfoStatic(pi.signingInfo);
+            }
+        }
+    }
+
+    private static void patchSigningInfoStatic(Object signingInfo) {
+        if (signingInfo == null) return;
+        try {
+            Class<?> clazz = signingInfo.getClass();
+            Field mSigningDetailsField = findFieldRecursiveStatic(clazz, "mSigningDetails");
+
+            if (mSigningDetailsField != null) {
+                Object signingDetails = mSigningDetailsField.get(signingInfo);
+                if (signingDetails != null) {
+                    Class<?> detailsClass = signingDetails.getClass();
+                    Field signaturesField = findFieldRecursiveStatic(detailsClass, "signatures");
+                    if (signaturesField != null) {
+                        signaturesField.set(signingDetails, new Signature[]{sFakeSig});
+                    }
+
+                    Field pastSignaturesField = findFieldRecursiveStatic(detailsClass, "pastSigningCertificates");
+                    if (pastSignaturesField != null) {
+                        pastSignaturesField.set(signingDetails, new Signature[]{sFakeSig});
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Field findFieldRecursiveStatic(Class<?> clazz, String fieldName) {
+        Class<?> curr = clazz;
+        while (curr != null && curr != Object.class) {
+            try {
+                Field f = curr.getDeclaredField(fieldName);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException e) {
+                curr = curr.getSuperclass();
+            }
+        }
+        return null;
+    }
+
     private Field findFieldRecursive(Class<?> clazz, String fieldName) {
         Class<?> curr = clazz;
         while (curr != null && curr != Object.class) {
@@ -698,7 +1215,10 @@ public class HookApplication extends Application {
         if (context == null) return null;
         try {
             File out = new File(context.getFilesDir(), "origin.apk");
-            if (out.exists() && out.length() > 0) return out;
+            if (out.exists() && out.length() > 0) {
+                sOriginApkPath = out.getAbsolutePath();
+                return out;
+            }
 
             File temp = new File(context.getFilesDir(), "origin.apk.tmp");
             try {
@@ -723,13 +1243,20 @@ public class HookApplication extends Application {
                 } catch (Throwable ignored) {
                 }
 
-                if (temp.renameTo(out)) return out;
+                if (temp.renameTo(out)) {
+                    sOriginApkPath = out.getAbsolutePath();
+                    return out;
+                }
                 try {
                     if (out.exists() && out.delete()) {
-                        if (temp.renameTo(out)) return out;
+                        if (temp.renameTo(out)) {
+                            sOriginApkPath = out.getAbsolutePath();
+                            return out;
+                        }
                     }
                 } catch (Throwable ignored) {
                 }
+                sOriginApkPath = out.getAbsolutePath();
                 return out;
             } finally {
                 try {
@@ -788,8 +1315,21 @@ public class HookApplication extends Application {
         if (originalApplicationClass.equals(this.getClass().getName())) return;
 
         try {
-            Class<?> delegateClass = Class.forName(originalApplicationClass);
-            Constructor<?> constructor = delegateClass.getConstructor();
+            ClassLoader cl = null;
+            try {
+                if (base != null) cl = base.getClassLoader();
+            } catch (Throwable ignored) {
+            }
+            if (cl == null) cl = this.getClassLoader();
+
+            Class<?> delegateClass = Class.forName(originalApplicationClass, false, cl);
+            Constructor<?> constructor;
+            try {
+                constructor = delegateClass.getDeclaredConstructor();
+                constructor.setAccessible(true);
+            } catch (Throwable e) {
+                constructor = delegateClass.getConstructor();
+            }
             sDelegateApp = (Application) constructor.newInstance();
 
             Method attachMethod = ContextWrapper.class.getDeclaredMethod("attachBaseContext", Context.class);

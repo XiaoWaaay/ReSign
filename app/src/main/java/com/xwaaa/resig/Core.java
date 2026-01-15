@@ -34,6 +34,9 @@ public class Core {
         public boolean enableIoRedirect = true;
         public boolean enableMapsHide = true;
         public boolean enableResourceRedirect = false;
+        public boolean debugLog = false;
+        public String hookMode = "standard";
+        public boolean enableDeepHide = true;
 
         public boolean enableCache = true;
         public boolean enablePayloadDexCache = true;
@@ -48,6 +51,8 @@ public class Core {
     private static final String META_ENABLE_MAPS_HIDE = "resig.enableMapsHide";
     private static final String META_ENABLE_RESOURCE_REDIRECT = "resig.enableResourceRedirect";
     private static final String META_DEBUG_LOG = "resig.debugLog";
+    private static final String META_HOOK_MODE = "resig.hookMode";
+    private static final String META_ENABLE_DEEP_HIDE = "resig.enableDeepHide";
 
     public Core(Appinfos appinfo, Context context) {
         this.appinfo = appinfo;
@@ -396,7 +401,9 @@ public class Core {
         out.add(META_ENABLE_IO_REDIRECT + ":" + String.valueOf(o.enableIoRedirect));
         out.add(META_ENABLE_MAPS_HIDE + ":" + String.valueOf(o.enableMapsHide));
         out.add(META_ENABLE_RESOURCE_REDIRECT + ":" + String.valueOf(o.enableResourceRedirect));
-        out.add(META_DEBUG_LOG + ":" + String.valueOf(false));
+        out.add(META_DEBUG_LOG + ":" + String.valueOf(o.debugLog));
+        out.add(META_HOOK_MODE + ":" + String.valueOf(o.hookMode));
+        out.add(META_ENABLE_DEEP_HIDE + ":" + String.valueOf(o.enableDeepHide));
         return out;
     }
 

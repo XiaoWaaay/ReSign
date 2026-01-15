@@ -7,6 +7,10 @@ OUT_DIR="$CURDIR/out"
 SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 PLATFORM_JAR=""
 
+if [ -z "$SDK" ] && [ -f "$CURDIR/local.properties" ]; then
+  SDK="$(sed -n 's/^sdk.dir=//p' "$CURDIR/local.properties" | tail -n 1)"
+fi
+
 if [ -n "$SDK" ] && [ -d "$SDK/platforms" ]; then
   while IFS= read -r plat; do
     if [ -f "$SDK/platforms/$plat/android.jar" ]; then

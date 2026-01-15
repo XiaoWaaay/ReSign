@@ -14,3 +14,9 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
 target_link_libraries(${CMAKE_PROJECT_NAME}
         android
         log)
+
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    target_link_libraries(${CMAKE_PROJECT_NAME}
+            ${CMAKE_CURRENT_LIST_DIR}/../include/libdobby.a)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE RESIG_HAS_DOBBY=1)
+endif()
