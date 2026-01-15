@@ -10,10 +10,14 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -23,8 +27,6 @@ import com.xwaaa.resig.ui.theme.ResigTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.IOException
 
 class MainActivity : ComponentActivity() {
 
@@ -32,6 +34,7 @@ class MainActivity : ComponentActivity() {
         private const val TAG = "MainActivity"
     }
 
+    @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -45,6 +48,11 @@ class MainActivity : ComponentActivity() {
                 }
 
                 Scaffold(
+                    topBar = {
+                        CenterAlignedTopAppBar(
+                            title = { Text("重打包安全检查") }
+                        )
+                    },
                     snackbarHost = { SnackbarHost(hostState = snackbarHostState) }
                 ) { padding ->
                     Surface(
@@ -60,57 +68,192 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private data class InstalledAppRow(
+        val appName: String,
+        val packageName: String,
+        val sourceApk: String
+    )
+
     @Composable
     fun InstalledAppsList(showMessage: (String) -> Unit) {
         val pm = packageManager
         val ctx = LocalContext.current
-        val installedApps = getInstalledApps()
+        val prefs = remember(ctx) { ctx.getSharedPreferences("resig_ui", Context.MODE_PRIVATE) }
+        var query by remember { mutableStateOf("") }
+        var enableJavaHook by remember { mutableStateOf(true) }
+        var enableNativeHook by remember { mutableStateOf(true) }
+        var enableIoRedirect by remember { mutableStateOf(true) }
+        var enableMapsHide by remember { mutableStateOf(prefs.getBoolean("enableMapsHide", true)) }
+        var enableResourceRedirect by remember { mutableStateOf(false) }
+        var enableCache by remember { mutableStateOf(true) }
+        var enablePayloadDexCache by remember { mutableStateOf(true) }
 
-        LazyColumn(modifier = Modifier.padding(16.dp)) {
-            items(installedApps.size) { index ->
-                val pkgInfo = installedApps[index]
+        val installedApps = remember {
+            getInstalledApps().map { pkgInfo ->
                 val appName = pkgInfo.applicationInfo.loadLabel(pm).toString()
                 val packageName = pkgInfo.packageName
-                val sourceApk = pkgInfo.applicationInfo.publicSourceDir ?: pkgInfo.applicationInfo.sourceDir
-                // 构造传入 onSignClick 的 Appinfo
-                val appinfo = Appinfos(name = appName, packageName = packageName, packagePath = sourceApk, signatures = null)
+                val sourceApk =
+                    pkgInfo.applicationInfo.publicSourceDir ?: pkgInfo.applicationInfo.sourceDir
+                InstalledAppRow(appName = appName, packageName = packageName, sourceApk = sourceApk)
+            }
+        }
 
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                        .clickable { onAppClick(appName) },
-                    shape = MaterialTheme.shapes.medium
-                ) {
-                    Row(
+        val filteredApps = remember(query, installedApps) {
+            val q = query.trim()
+            if (q.isEmpty()) {
+                installedApps
+            } else {
+                installedApps.filter { app ->
+                    app.appName.contains(q, ignoreCase = true) ||
+                        app.packageName.contains(q, ignoreCase = true)
+                }
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            Spacer(modifier = Modifier.height(4.dp))
+
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("搜索") },
+                placeholder = { Text("按应用名或包名过滤") },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        TextButton(onClick = { query = "" }) {
+                            Text("清除")
+                        }
+                    }
+                }
+            )
+
+            Text(text = "功能选项", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = enableJavaHook, onCheckedChange = { enableJavaHook = it })
+                Text(text = "启用 Java Hook")
+                Spacer(modifier = Modifier.width(12.dp))
+                Checkbox(checked = enableNativeHook, onCheckedChange = { enableNativeHook = it })
+                Text(text = "启用 Native Hook")
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "后端：seccomp（默认）",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = enableIoRedirect, onCheckedChange = { enableIoRedirect = it })
+                Text(text = "启用 IO/SVC 重定向")
+                Spacer(modifier = Modifier.width(12.dp))
+                Checkbox(checked = enableResourceRedirect, onCheckedChange = { enableResourceRedirect = it })
+                Text(text = "启用资源重定向（实验）")
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = enableMapsHide,
+                    onCheckedChange = {
+                        enableMapsHide = it
+                        prefs.edit().putBoolean("enableMapsHide", it).apply()
+                    }
+                )
+                Text(text = "启用 maps 隐藏（实验）")
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = enableCache, onCheckedChange = { enableCache = it })
+                Text(text = "启用解包缓存")
+                Spacer(modifier = Modifier.width(12.dp))
+                Checkbox(checked = enablePayloadDexCache, onCheckedChange = { enablePayloadDexCache = it })
+                Text(text = "启用 payload dex 缓存")
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "已安装应用：${filteredApps.size}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(filteredApps.size) { index ->
+                    val app = filteredApps[index]
+                    val appinfo = Appinfos(
+                        name = app.appName,
+                        packageName = app.packageName,
+                        packagePath = app.sourceApk,
+                        signatures = null
+                    )
+
+                    Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                            .padding(bottom = 8.dp)
+                            .clickable { onAppClick(app.appName) },
+                        shape = MaterialTheme.shapes.medium
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(text = appName, style = MaterialTheme.typography.bodyLarge)
-                            Text(
-                                text = packageName,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-
-                        Button(
-                            onClick = {
-                                onSignClick(
-                                    appName = appName,
-                                    appinfo = appinfo,
-                                    context = ctx,
-                                    packageName = packageName,
-                                    showMessage = showMessage
-                                )
-                            },
-                            modifier = Modifier.padding(start = 16.dp)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text("去签")
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(text = app.appName, style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    text = app.packageName,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                            }
+
+                            Button(
+                                onClick = {
+                                    val enableJava = enableJavaHook
+                                    val enableNative = enableNativeHook
+                                    val enableIo = enableIoRedirect
+                                    val enableMaps = enableMapsHide
+                                    val enableRes = enableResourceRedirect
+                                    val cache = enableCache
+                                    val payloadCache = enablePayloadDexCache
+
+                                    val options = Core.Options().apply {
+                                        enableJavaHook = enableJava
+                                        enableNativeHook = enableNative
+                                        enableIoRedirect = enableIo
+                                        enableMapsHide = enableMaps
+                                        enableResourceRedirect = enableRes
+                                        enableCache = cache
+                                        enablePayloadDexCache = payloadCache
+                                    }
+                                    onRepackClick(
+                                        appName = app.appName,
+                                        appinfo = appinfo,
+                                        context = ctx,
+                                        options = options,
+                                        showMessage = showMessage
+                                    )
+                                },
+                                modifier = Modifier.padding(start = 16.dp)
+                            ) {
+                                Text("重打包")
+                            }
                         }
                     }
                 }
@@ -132,27 +275,26 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "点击了 $appName")
     }
 
-    private fun onSignClick(
+    private fun onRepackClick(
         appName: String,
         appinfo: Appinfos,
         context: Context,
-        packageName: String? = null,
+        options: Core.Options,
         showMessage: (String) -> Unit
     ) {
         showMessage("准备处理 $appName ...")
 
-        // ✅ 使用协程后台执行
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                Core(appinfo, context).begin()
+                Core(appinfo, context, options).begin()
                 withContext(Dispatchers.Main) {
-                    showMessage("$appName 去签完成！")
+                    showMessage("$appName 完成！")
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    showMessage("去签失败: ${e.message}")
+                    showMessage("处理失败: ${e.message}")
                 }
-                Log.e("MainActivity", "去签出错: ${e.message}")
+                Log.e("MainActivity", "处理出错: ${e.message}")
             }
         }
     }

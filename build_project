@@ -6,6 +6,7 @@ WRAPPER="$ROOT_DIR/gradlew"
 MODULE="app"
 CLEAN=false
 DEBUG=false
+LINT=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -14,6 +15,9 @@ while [ $# -gt 0 ]; do
       ;;
     --debug)
       DEBUG=true
+      ;;
+    --lint)
+      LINT=true
       ;;
     --module)
       shift
@@ -66,11 +70,24 @@ if $DEBUG; then
   OUT_DIR="$ROOT_DIR/$MODULE/build/outputs/apk/debug"
 fi
 
+if $LINT; then
+  if $DEBUG; then
+    TASK=":$MODULE:lintDebug"
+  else
+    TASK=":$MODULE:lintRelease"
+  fi
+fi
+
 if $CLEAN; then
   bash "$WRAPPER" clean "$TASK" --no-daemon
 else
   bash "$WRAPPER" "$TASK" --no-daemon
 fi
+if $LINT; then
+  echo "✅ Lint 完成"
+  exit 0
+fi
+
 if [ ! -d "$OUT_DIR" ]; then
   echo "[错误] 未找到输出目录: $OUT_DIR"
   exit 1

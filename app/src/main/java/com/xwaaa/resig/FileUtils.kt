@@ -21,9 +21,9 @@ object FileUtils {
 
     //复制文件从原目录到新目录
     @Throws(IOException::class)
-    open fun copyFile(sourceFilePath: String, destDirectory: String?) {
+    fun copyFile(sourceFilePath: String, destDirectory: String) {
         val sourceFile = File(sourceFilePath)
-        val destDir = File(destDirectory ?: "")
+        val destDir = File(destDirectory)
         if (!destDir.exists()) destDir.mkdirs()
         val destFile = File(destDir, sourceFile.name)
         try {
@@ -52,7 +52,7 @@ object FileUtils {
     }
     //解压APK中的dex文件操作
     @Throws(IOException::class)
-    open fun extractDexFile(apkFilePath: String, destDirectory: String) {
+    fun extractDexFile(apkFilePath: String, destDirectory: String) {
         val apkFile = File(apkFilePath)
         if (!apkFile.exists()) throw FileNotFoundException("APK 未找到: $apkFilePath")
 
@@ -93,7 +93,7 @@ object FileUtils {
 
     //解压APK中的xml文件
     @Throws(IOException::class)
-    open fun extractXmlFile(apkFilePath: String, destDirectory: String) {
+    fun extractXmlFile(apkFilePath: String, destDirectory: String) {
         val apkFile = File(apkFilePath)
         val destDir = File(destDirectory)
         if (!destDir.exists()) {
@@ -150,52 +150,34 @@ object FileUtils {
         }
     }
 
-    open fun copyAssetToFile(context: Context, assetFileName: String?, destFilePath: String?, name: String) {
-        var `in`: InputStream? = null
-        var out: FileOutputStream? = null
-        try {
-            try {
+    fun copyAssetToFile(context: Context, assetFileName: String?, destFilePath: String?, name: String) {
+        if (assetFileName.isNullOrEmpty()) throw IllegalArgumentException("assetFileName is empty")
+        if (destFilePath.isNullOrEmpty()) throw IllegalArgumentException("destFilePath is empty")
+
+        val destDir = File(destFilePath)
+        if (!destDir.exists()) destDir.mkdirs()
+
+        val destFile = File(destDir, name)
+        context.assets.open(assetFileName).use { input ->
+            FileOutputStream(destFile).use { output ->
+                val buffer = ByteArray(256 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                }
                 try {
-                    `in` = context.assets.open(assetFileName!!)
-                    val outFile = File(destFilePath)
-                    outFile.parentFile.mkdirs()
-                    out = FileOutputStream(outFile.toString() + File.separator + name)
-                    val buffer = ByteArray(1024)
-                    while (true) {
-                        val read = `in`.read(buffer)
-                        if (read == -1) {
-                            break
-                        }
-                        out.write(buffer, 0, read)
-                    }
-                    if (`in` != null) {
-                        `in`.close()
-                    }
-                    out.close()
-                } catch (e: IOException) {
-                    e.printStackTrace()
-                    `in`?.close()
-                    out?.close()
+                    output.fd.sync()
+                } catch (_: Throwable) {
                 }
-            } catch (th: Throwable) {
-                if (`in` != null) {
-                    try {
-                        `in`.close()
-                    } catch (e2: IOException) {
-                        e2.printStackTrace()
-                        throw th
-                    }
-                }
-                out?.close()
-                throw th
             }
-        } catch (e3: IOException) {
-            e3.printStackTrace()
         }
     }
 
     @Throws(IOException::class)
     fun copyFile(sourceFilePath: String, destDirectory: String?, destFileName: String?) {
+        if (destDirectory.isNullOrEmpty()) throw IllegalArgumentException("destDirectory is empty")
+        if (destFileName.isNullOrEmpty()) throw IllegalArgumentException("destFileName is empty")
         val sourceFile = File(sourceFilePath)
         val destDir = File(destDirectory)
         if (!destDir.exists()) {
@@ -236,23 +218,29 @@ object FileUtils {
     }
 
     fun addToZip(sourceFile: File?, zipFilePath: String?, directoryInZip: String?) {
-        try {
-            val zipFile = ZipFile(zipFilePath)
-            val zipParameters = ZipParameters()
-            zipParameters.compressionMethod = CompressionMethod.STORE
-            zipParameters.compressionLevel = CompressionLevel.NORMAL
-            if (directoryInZip != null && !directoryInZip.isEmpty()) {
-                zipParameters.rootFolderNameInZip = directoryInZip
-            }
-            if (!zipFile.isValidZipFile()) {
-                println("目标 ZIP 文件无效或不存在！")
-                return
-            }
-            zipFile.addFile(sourceFile, zipParameters)
-            println("文件已成功添加到 ZIP 文件中的目录：$directoryInZip")
-        } catch (e: Exception) {
-            e.printStackTrace()
+        if (sourceFile == null || !sourceFile.exists()) throw FileNotFoundException("Source file not found")
+        if (zipFilePath.isNullOrEmpty()) throw IllegalArgumentException("zipFilePath is empty")
+
+        val zipFile = ZipFile(zipFilePath)
+        if (!zipFile.isValidZipFile) throw IllegalStateException("Invalid zip file: $zipFilePath")
+
+        val prefix = (directoryInZip ?: "").let {
+            if (it.isEmpty()) "" else if (it.endsWith("/")) it else "$it/"
         }
+
+        val entryName = prefix + sourceFile.name
+        try {
+            zipFile.removeFile(entryName)
+        } catch (_: Throwable) {
+        }
+
+        val zipParameters = ZipParameters().apply {
+            compressionMethod = CompressionMethod.STORE
+            compressionLevel = CompressionLevel.NORMAL
+            fileNameInZip = entryName
+            isOverrideExistingFilesInZip = true
+        }
+        zipFile.addFile(sourceFile, zipParameters)
     }
 
 

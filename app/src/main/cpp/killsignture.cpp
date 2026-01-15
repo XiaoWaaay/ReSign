@@ -18,12 +18,14 @@
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <stddef.h>   // offsetof
 #include <string.h>   // 仅用于 memset
 #include <stdlib.h>   // malloc/free/strdup
 #include <errno.h>
 #include <sys/uio.h>
+#include <stdarg.h>
 
 // ===== 日志（避免在信号处理器里使用 LOG*）=====
 #define TAG "resig-native"
@@ -58,16 +60,74 @@
 #if !defined(SYS_openat) && defined(__NR_openat)
 # define SYS_openat __NR_openat
 #endif
+#if !defined(SYS_openat2) && defined(__NR_openat2)
+# define SYS_openat2 __NR_openat2
+#endif
 #if !defined(SYS_readlinkat) && defined(__NR_readlinkat)
 # define SYS_readlinkat __NR_readlinkat
+#endif
+#if !defined(SYS_faccessat) && defined(__NR_faccessat)
+# define SYS_faccessat __NR_faccessat
+#endif
+#if !defined(SYS_newfstatat) && defined(__NR_newfstatat)
+# define SYS_newfstatat __NR_newfstatat
+#endif
+#if !defined(SYS_statx) && defined(__NR_statx)
+# define SYS_statx __NR_statx
 #endif
 #if !defined(SYS_write) && defined(__NR_write)
 # define SYS_write __NR_write
 #endif
+#if !defined(SYS_read) && defined(__NR_read)
+# define SYS_read __NR_read
+#endif
+#if !defined(SYS_close) && defined(__NR_close)
+# define SYS_close __NR_close
+#endif
+#if !defined(SYS_lseek) && defined(__NR_lseek)
+# define SYS_lseek __NR_lseek
+#endif
+#if !defined(SYS_memfd_create) && defined(__NR_memfd_create)
+# define SYS_memfd_create __NR_memfd_create
+#endif
 
+static constexpr unsigned int kSysInvalid = 0xffffffffu;
 static constexpr unsigned int kSysOpenat = SYS_openat;
+static constexpr unsigned int kSysOpenat2 =
+#if defined(SYS_openat2)
+        SYS_openat2;
+#else
+        kSysInvalid;
+#endif
 static constexpr unsigned int kSysReadlinkat = SYS_readlinkat;
+static constexpr unsigned int kSysFaccessat =
+#if defined(SYS_faccessat)
+        SYS_faccessat;
+#else
+        kSysInvalid;
+#endif
+static constexpr unsigned int kSysNewfstatat =
+#if defined(SYS_newfstatat)
+        SYS_newfstatat;
+#else
+        kSysInvalid;
+#endif
+static constexpr unsigned int kSysStatx =
+#if defined(SYS_statx)
+        SYS_statx;
+#else
+        kSysInvalid;
+#endif
 static constexpr unsigned int kSysWrite = SYS_write;
+static constexpr unsigned int kSysRead = SYS_read;
+static constexpr unsigned int kSysClose = SYS_close;
+static constexpr unsigned int kSysLseek = SYS_lseek;
+static constexpr unsigned int kSysMemfdCreate =
+#if defined(SYS_memfd_create)
+        SYS_memfd_create;
+#else
+        kSysInvalid;
+#endif
 
 static inline long raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5);
 
@@ -97,6 +157,251 @@ static int g_dbg_pipe_r = -1;
 static int g_dbg_started = 0;
 static int g_dbg_enabled = 0;
 static pthread_t g_dbg_thread;
+
+static inline int c_has_sub(const char* s, const char* sub);
+static inline long c_strlen(const char* s);
+static inline int c_ends_with(const char* s, const char* suf);
+static inline int c_has_prefix(const char* s, const char* pre);
+static inline int c_parse_int(const char* s, int* out);
+static inline const char* c_basename(const char* path);
+static inline int is_redirected_fd(int fd);
+static inline void mark_redirected_fd(int fd);
+static inline void unmark_redirected_fd(int fd);
+
+enum RedirectBackend {
+  REDIRECT_BACKEND_NONE = 0,
+  REDIRECT_BACKEND_SECCOMP_SIGSYS = 2,
+};
+
+static int g_redirect_backend = REDIRECT_BACKEND_NONE;
+static volatile int g_maps_hide_enabled = 1;
+
+using OpenFn = int (*)(const char *, int, ...);
+using OpenatFn = int (*)(int, const char *, int, ...);
+using Openat2Fn = int (*)(int, const char*, const void*, size_t);
+using ReadlinkFn = ssize_t (*)(const char *, char *, size_t);
+using ReadlinkatFn = ssize_t (*)(int, const char *, char *, size_t);
+using AccessFn = int (*)(const char*, int);
+using FaccessatFn = int (*)(int, const char*, int, int);
+using StatFn = int (*)(const char*, struct stat*);
+using LstatFn = int (*)(const char*, struct stat*);
+using NewfstatatFn = int (*)(int, const char*, struct stat*, int);
+using StatxFn = int (*)(int, const char*, int, unsigned int, void*);
+
+static OpenFn g_orig_open = nullptr;
+static OpenatFn g_orig_openat = nullptr;
+static Openat2Fn g_orig_openat2 = nullptr;
+static ReadlinkFn g_orig_readlink = nullptr;
+static ReadlinkatFn g_orig_readlinkat = nullptr;
+static AccessFn g_orig_access = nullptr;
+static FaccessatFn g_orig_faccessat = nullptr;
+static StatFn g_orig_stat = nullptr;
+static LstatFn g_orig_lstat = nullptr;
+static NewfstatatFn g_orig_newfstatat = nullptr;
+static StatxFn g_orig_statx = nullptr;
+
+static inline int should_redirect_path(const char *pathname) {
+  if (!pathname || !g_rep_path) return 0;
+  if (g_rep_path[0] == '\0') return 0;
+
+  if (g_apk_path && g_apk_path[0] != '\0') {
+    if (strcmp(pathname, g_apk_path) == 0) return 1;
+    if (c_ends_with(pathname, g_apk_path)) return 1;
+
+    const char *apk_base = c_basename(g_apk_path);
+    if (apk_base && apk_base[0] != '\0') {
+      if (strcmp(pathname, apk_base) == 0) return 1;
+      if (c_ends_with(pathname, apk_base) && c_has_sub(pathname, "/base.apk")) return 1;
+    }
+  }
+
+  if (strcmp(pathname, "base.apk") == 0) return 1;
+  if (c_ends_with(pathname, "/base.apk")) return 1;
+  return 0;
+}
+
+static inline const char *maybe_redirect_path(const char *pathname, int *did_redirect) {
+  if (did_redirect) *did_redirect = 0;
+  if (!pathname) return pathname;
+  if (should_redirect_path(pathname)) {
+    if (did_redirect) *did_redirect = 1;
+    return g_rep_path;
+  }
+  return pathname;
+}
+
+static int open_hook(const char *pathname, int flags, ...) {
+  mode_t mode = 0;
+  if (flags & O_CREAT) {
+    va_list ap;
+    va_start(ap, flags);
+    mode = (mode_t)va_arg(ap, int);
+    va_end(ap);
+  }
+
+  int did_redirect = 0;
+  const char *p = maybe_redirect_path(pathname, &did_redirect);
+
+  int fd;
+  if (flags & O_CREAT) {
+    fd = g_orig_open ? g_orig_open(p, flags, mode) : -1;
+  } else {
+    fd = g_orig_open ? g_orig_open(p, flags) : -1;
+  }
+
+  if (fd >= 0 && (did_redirect || (p && g_rep_path && c_ends_with(p, g_rep_path)))) {
+    mark_redirected_fd(fd);
+  }
+  return fd;
+}
+
+static int openat_hook(int dirfd, const char *pathname, int flags, ...) {
+  mode_t mode = 0;
+  if (flags & O_CREAT) {
+    va_list ap;
+    va_start(ap, flags);
+    mode = (mode_t)va_arg(ap, int);
+    va_end(ap);
+  }
+
+  int did_redirect = 0;
+  const char *p = maybe_redirect_path(pathname, &did_redirect);
+
+  int fd;
+  if (flags & O_CREAT) {
+    fd = g_orig_openat ? g_orig_openat(dirfd, p, flags, mode) : -1;
+  } else {
+    fd = g_orig_openat ? g_orig_openat(dirfd, p, flags) : -1;
+  }
+
+  if (fd >= 0 && (did_redirect || (p && g_rep_path && c_ends_with(p, g_rep_path)))) {
+    mark_redirected_fd(fd);
+  }
+  return fd;
+}
+
+static int openat2_hook(int dirfd, const char* pathname, const void* how, size_t size) {
+  int did_redirect = 0;
+  const char* p = maybe_redirect_path(pathname, &did_redirect);
+  int fd = g_orig_openat2 ? g_orig_openat2(dirfd, p, how, size) : -1;
+  if (fd >= 0 && (did_redirect || (p && g_rep_path && c_ends_with(p, g_rep_path)))) {
+    mark_redirected_fd(fd);
+  }
+  return fd;
+}
+
+static int access_hook(const char* pathname, int mode) {
+  int did_redirect = 0;
+  const char* p = maybe_redirect_path(pathname, &did_redirect);
+  return g_orig_access ? g_orig_access(p, mode) : -1;
+}
+
+static int faccessat_hook(int dirfd, const char* pathname, int mode, int flags) {
+  int did_redirect = 0;
+  const char* p = maybe_redirect_path(pathname, &did_redirect);
+  return g_orig_faccessat ? g_orig_faccessat(dirfd, p, mode, flags) : -1;
+}
+
+static int stat_hook(const char* pathname, struct stat* st) {
+  int did_redirect = 0;
+  const char* p = maybe_redirect_path(pathname, &did_redirect);
+  return g_orig_stat ? g_orig_stat(p, st) : -1;
+}
+
+static int lstat_hook(const char* pathname, struct stat* st) {
+  int did_redirect = 0;
+  const char* p = maybe_redirect_path(pathname, &did_redirect);
+  return g_orig_lstat ? g_orig_lstat(p, st) : -1;
+}
+
+static int newfstatat_hook(int dirfd, const char* pathname, struct stat* st, int flags) {
+  int did_redirect = 0;
+  const char* p = maybe_redirect_path(pathname, &did_redirect);
+  return g_orig_newfstatat ? g_orig_newfstatat(dirfd, p, st, flags) : -1;
+}
+
+static int statx_hook(int dirfd, const char* pathname, int flags, unsigned int mask, void* buf) {
+  int did_redirect = 0;
+  const char* p = maybe_redirect_path(pathname, &did_redirect);
+  return g_orig_statx ? g_orig_statx(dirfd, p, flags, mask, buf) : -1;
+}
+
+static inline int should_fake_readlink_for_fd_path(const char *pathname, int *out_fd) {
+  if (!pathname || !out_fd) return 0;
+  if (!c_has_prefix(pathname, "/proc/self/fd/")) return 0;
+  int fd = -1;
+  if (c_parse_int(pathname + 14, &fd) != 0) return 0;
+  *out_fd = fd;
+  return 1;
+}
+
+static inline ssize_t fake_readlink_to_src(char *buf, size_t bufsiz) {
+  if (!buf || bufsiz == 0 || !g_apk_path) return -EINVAL;
+  size_t n = (size_t)c_strlen(g_apk_path);
+  if (n > bufsiz) n = bufsiz;
+  memcpy(buf, g_apk_path, n);
+  return (ssize_t)n;
+}
+
+static ssize_t readlink_hook(const char *pathname, char *buf, size_t bufsiz) {
+  if (!g_orig_readlink) return -1;
+
+  if (pathname && g_apk_path && c_has_sub(pathname, "origin.apk")) {
+    return fake_readlink_to_src(buf, bufsiz);
+  }
+
+  int fd = -1;
+  if (should_fake_readlink_for_fd_path(pathname, &fd) && fd >= 0 && is_redirected_fd(fd) && g_apk_path) {
+    char tmp[512];
+    ssize_t r = g_orig_readlink(pathname, tmp, sizeof(tmp) - 1);
+    if (r > 0) {
+      tmp[(r < (ssize_t)sizeof(tmp) - 1) ? r : (ssize_t)sizeof(tmp) - 1] = '\0';
+      int match = 0;
+      if (g_rep_path && g_rep_path[0] != '\0') {
+        if (c_has_sub(tmp, g_rep_path)) {
+          match = 1;
+        } else {
+          const char *rep_base = c_basename(g_rep_path);
+          if (rep_base && rep_base[0] != '\0' && c_has_sub(tmp, rep_base)) match = 1;
+        }
+      }
+      if (match) return fake_readlink_to_src(buf, bufsiz);
+    }
+    unmark_redirected_fd(fd);
+  }
+
+  return g_orig_readlink(pathname, buf, bufsiz);
+}
+
+static ssize_t readlinkat_hook(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+  if (!g_orig_readlinkat) return -1;
+
+  if (pathname && g_apk_path && c_has_sub(pathname, "origin.apk")) {
+    return fake_readlink_to_src(buf, bufsiz);
+  }
+
+  int fd = -1;
+  if (should_fake_readlink_for_fd_path(pathname, &fd) && fd >= 0 && is_redirected_fd(fd) && g_apk_path) {
+    char tmp[512];
+    ssize_t r = g_orig_readlinkat(dirfd, pathname, tmp, sizeof(tmp) - 1);
+    if (r > 0) {
+      tmp[(r < (ssize_t)sizeof(tmp) - 1) ? r : (ssize_t)sizeof(tmp) - 1] = '\0';
+      int match = 0;
+      if (g_rep_path && g_rep_path[0] != '\0') {
+        if (c_has_sub(tmp, g_rep_path)) {
+          match = 1;
+        } else {
+          const char *rep_base = c_basename(g_rep_path);
+          if (rep_base && rep_base[0] != '\0' && c_has_sub(tmp, rep_base)) match = 1;
+        }
+      }
+      if (match) return fake_readlink_to_src(buf, bufsiz);
+    }
+    unmark_redirected_fd(fd);
+  }
+
+  return g_orig_readlinkat(dirfd, pathname, buf, bufsiz);
+}
 
 // ===== 简单 async-signal-safe 字符串工具 =====
 static inline int c_has_sub(const char* s, const char* sub) {
@@ -522,9 +827,13 @@ static int install_seccomp_filter_all_threads() {
    const uint32_t end_hi = (uint32_t)((end >> 32) & 0xffffffffULL);
    const uint32_t ip_off = (uint32_t)offsetof(struct seccomp_data, instruction_pointer);
 
-   struct sock_filter filter_same_hi[] = {
+  struct sock_filter filter_same_hi[] = {
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 2, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 6, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat2, 5, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysFaccessat, 4, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysNewfstatat, 3, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysStatx, 2, 0),
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 1, 0),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 
@@ -537,9 +846,13 @@ static int install_seccomp_filter_all_threads() {
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
    };
 
-   struct sock_filter filter_diff_hi[] = {
+  struct sock_filter filter_diff_hi[] = {
            BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 2, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat, 6, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysOpenat2, 5, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysFaccessat, 4, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysNewfstatat, 3, 0),
+           BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysStatx, 2, 0),
            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSysReadlinkat, 1, 0),
            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 
@@ -650,7 +963,12 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
    return;
 #endif
 
-   if (nr != kSysOpenat && nr != kSysReadlinkat) return;
+   if (nr != (long)kSysOpenat
+       && nr != (long)kSysOpenat2
+       && nr != (long)kSysFaccessat
+       && nr != (long)kSysNewfstatat
+       && nr != (long)kSysStatx
+       && nr != (long)kSysReadlinkat) return;
 
    if (g_in_sigsys_handler != 0) {
        SET_RET(-ENOSYS);
@@ -658,26 +976,95 @@ static void sigsys_handler(int signo, siginfo_t*, void* context) {
    }
    g_in_sigsys_handler = 1;
 
-   // --- openat(56)：如果 pathname 含 ".apk" 则改为 g_rep_path ---
-   if (nr == kSysOpenat) {
+   if (nr == (long)kSysOpenat
+       || nr == (long)kSysOpenat2
+       || nr == (long)kSysFaccessat
+       || nr == (long)kSysNewfstatat
+       || nr == (long)kSysStatx) {
        const char* pathname_ptr = (const char*)a1;
        char pathname[512];
        pathname[0] = '\0';
        (void)safe_copy_cstr_from_ptr((const void*)pathname_ptr, pathname, (int)sizeof(pathname));
-       int did_redirect = 0;
-       int opened_rep = 0;
-       if (pathname[0] != '\0' && g_apk_path && g_rep_path && g_apk_path[0] != '\0') {
-           if (c_ends_with(pathname, g_apk_path)) {
-               a1 = (long)g_rep_path; // 替换路径
-               did_redirect = 1;
-               opened_rep = 1;
-           } else if (g_rep_path[0] != '\0' && c_ends_with(pathname, g_rep_path)) {
-               opened_rep = 1;
+
+       if ((nr == (long)kSysOpenat || nr == (long)kSysOpenat2)
+               && pathname[0] != '\0'
+               && c_has_prefix(pathname, "/proc/")
+               && c_ends_with(pathname, "/maps")
+               && kSysMemfdCreate != kSysInvalid
+               && kSysRead != kSysInvalid
+               && kSysClose != kSysInvalid
+               && kSysLseek != kSysInvalid) {
+           long raw_fd = raw_syscall6((long)nr, a0, a1, a2, a3, a4, a5);
+           if (raw_fd >= 0) {
+               static const char kMemfdName[] = "m";
+               long memfd = raw_syscall6((long)kSysMemfdCreate, (long)kMemfdName, 0, 0, 0, 0, 0);
+               if (memfd >= 0) {
+                   static const char kNeedle[] = "killsignture";
+                   const int needle_len = (int)(sizeof(kNeedle) - 1);
+                   char carry[32];
+                   int carry_len = 0;
+                   char buf[4096];
+                   char tmp[4096 + 32];
+
+                   while (true) {
+                       long nread = raw_syscall6((long)kSysRead, raw_fd, (long)buf, (long)sizeof(buf), 0, 0, 0);
+                       if (nread <= 0) break;
+
+                       int total = carry_len + (int)nread;
+                       if (total > (int)sizeof(tmp)) total = (int)sizeof(tmp);
+
+                       for (int i = 0; i < carry_len; ++i) tmp[i] = carry[i];
+                       for (int i = 0; i < (int)nread && (carry_len + i) < (int)sizeof(tmp); ++i) tmp[carry_len + i] = buf[i];
+
+                       for (int i = 0; i <= total - needle_len; ++i) {
+                           int match = 1;
+                           for (int j = 0; j < needle_len; ++j) {
+                               if (tmp[i + j] != kNeedle[j]) {
+                                   match = 0;
+                                   break;
+                               }
+                           }
+                           if (match) {
+                               for (int j = 0; j < needle_len; ++j) tmp[i + j] = ' ';
+                           }
+                       }
+
+                       int tail_keep = needle_len - 1;
+                       int write_len = total - tail_keep;
+                       if (write_len < 0) write_len = 0;
+
+                       if (write_len > 0) {
+                           (void)raw_syscall6((long)kSysWrite, memfd, (long)tmp, (long)write_len, 0, 0, 0);
+                       }
+
+                       carry_len = total - write_len;
+                       if (carry_len > 0) {
+                           for (int i = 0; i < carry_len; ++i) carry[i] = tmp[write_len + i];
+                       }
+                   }
+
+                   if (carry_len > 0) {
+                       (void)raw_syscall6((long)kSysWrite, memfd, (long)carry, (long)carry_len, 0, 0, 0);
+                   }
+
+                   (void)raw_syscall6((long)kSysClose, raw_fd, 0, 0, 0, 0, 0);
+                   (void)raw_syscall6((long)kSysLseek, memfd, 0, SEEK_SET, 0, 0, 0);
+
+                   SET_RET(memfd);
+                   g_in_sigsys_handler = 0;
+                   return;
+               }
+               (void)raw_syscall6((long)kSysClose, raw_fd, 0, 0, 0, 0, 0);
            }
        }
+       int did_redirect = 0;
+       if (pathname[0] != '\0' && should_redirect_path(pathname)) {
+           a1 = (long)g_rep_path;
+           did_redirect = 1;
+       }
 
-       long ret = raw_syscall6((long)kSysOpenat, a0, a1, a2, a3, 0, 0);
-       if ((did_redirect || opened_rep) && ret >= 0) {
+       long ret = raw_syscall6((long)nr, a0, a1, a2, a3, a4, a5);
+       if ((nr == (long)kSysOpenat || nr == (long)kSysOpenat2) && did_redirect && ret >= 0) {
            mark_redirected_fd((int)ret);
        }
        SET_RET(ret);
@@ -792,11 +1179,39 @@ static int install_sigsys() {
    return 0;
 }
 
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_xwaaa_hook_HookApplication_hookApkPathWithBackend(
+       JNIEnv* env, jclass clazz, jstring jSourcePath, jstring jRepPath, jint backend);
+
 // ===== JNI 入口：设置路径 + 启动工人线程 + 安装 SIGSYS + 安装 seccomp =====
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_xwaaa_hook_HookApplication_hookApkPath(
        JNIEnv* env, jclass /*clazz*/, jstring jSourcePath, jstring jRepPath) {
+  Java_com_xwaaa_hook_HookApplication_hookApkPathWithBackend(env, nullptr, jSourcePath, jRepPath, 0);
+}
+
+static void install_seccomp_backend_best_effort() {
+  if (find_self_map_range(&g_self_map_start, &g_self_map_end_inclusive) != 0) {
+    LOGE("find_self_map_range failed");
+  }
+
+  if (install_sigsys() != 0) {
+    LOGE("install_sigsys failed");
+  }
+
+  if (install_seccomp_filter_all_threads() != 0) {
+    LOGE("install_seccomp_filter_all_threads failed");
+  }
+
+  g_redirect_backend = REDIRECT_BACKEND_SECCOMP_SIGSYS;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_xwaaa_hook_HookApplication_hookApkPathWithBackend(
+       JNIEnv* env, jclass /*clazz*/, jstring jSourcePath, jstring jRepPath, jint backend) {
    const char* src = env->GetStringUTFChars(jSourcePath, nullptr);
    const char* rep = env->GetStringUTFChars(jRepPath, nullptr);
 
@@ -805,7 +1220,9 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
    if (g_rep_path) { free((void*)g_rep_path); g_rep_path = nullptr; }
    g_apk_path = strdup(src ? src : "");
    g_rep_path = strdup(rep ? rep : "");
-   LOGI("hookApkPath: src=%s, rep=%s", g_apk_path, g_rep_path);
+   if (g_dbg_enabled) {
+       LOGI("hookApkPath: src=%s, rep=%s", g_apk_path, g_rep_path);
+   }
 
    g_self_pid = getpid();
 
@@ -817,21 +1234,10 @@ Java_com_xwaaa_hook_HookApplication_hookApkPath(
        return;
    }
 
-   if (find_self_map_range(&g_self_map_start, &g_self_map_end_inclusive) != 0) {
-       LOGE("find_self_map_range failed");
-   }
+  install_seccomp_backend_best_effort();
 
-   // 2) 安装 SIGSYS 处理器
-   if (install_sigsys() != 0) {
-       LOGE("install_sigsys failed");
-   }
-
-   if (install_seccomp_filter_all_threads() != 0) {
-       LOGE("install_seccomp_filter_all_threads failed");
-   }
-
-   env->ReleaseStringUTFChars(jSourcePath, src);
-   env->ReleaseStringUTFChars(jRepPath, rep);
+  env->ReleaseStringUTFChars(jSourcePath, src);
+  env->ReleaseStringUTFChars(jRepPath, rep);
 }
 
 // 可选清理
@@ -841,4 +1247,89 @@ Java_com_xwaaa_hook_HookApplication_cleanup(JNIEnv*, jclass) {
    if (g_apk_path) { free((void*)g_apk_path); g_apk_path = nullptr; }
    if (g_rep_path) { free((void*)g_rep_path); g_rep_path = nullptr; }
    // 管道/线程可按需收尾；通常进程退出由内核清理
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_xwaaa_hook_HookApplication_getRedirectBackend(JNIEnv*, jclass) {
+  return g_redirect_backend;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_xwaaa_resig_NativeRedirector_getRedirectBackend(JNIEnv*, jclass) {
+  return g_redirect_backend;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_xwaaa_resig_NativeRedirector_installRedirect(JNIEnv* env, jclass, jstring jSourcePath, jstring jRepPath) {
+  const char* src = env->GetStringUTFChars(jSourcePath, nullptr);
+  const char* rep = env->GetStringUTFChars(jRepPath, nullptr);
+
+  if (g_apk_path) { free((void*)g_apk_path); g_apk_path = nullptr; }
+  if (g_rep_path) { free((void*)g_rep_path); g_rep_path = nullptr; }
+  g_apk_path = strdup(src ? src : "");
+  g_rep_path = strdup(rep ? rep : "");
+
+  env->ReleaseStringUTFChars(jSourcePath, src);
+  env->ReleaseStringUTFChars(jRepPath, rep);
+
+  g_self_pid = getpid();
+  install_seccomp_backend_best_effort();
+  return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_xwaaa_resig_NativeRedirector_openForTest(JNIEnv* env, jclass, jstring jPath) {
+  const char* p = env->GetStringUTFChars(jPath, nullptr);
+  int fd = open(p ? p : "", O_RDONLY);
+  env->ReleaseStringUTFChars(jPath, p);
+  return (jint)fd;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_xwaaa_resig_NativeRedirector_closeForTest(JNIEnv*, jclass, jint fd) {
+  if (fd >= 0) close((int)fd);
+}
+
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_com_xwaaa_resig_NativeRedirector_readHeadForTest(JNIEnv* env, jclass, jstring jPath, jint maxLen) {
+  const char* p = env->GetStringUTFChars(jPath, nullptr);
+  int fd = open(p ? p : "", O_RDONLY);
+  env->ReleaseStringUTFChars(jPath, p);
+  if (fd < 0) return nullptr;
+
+  int want = (int)maxLen;
+  if (want <= 0) {
+    close(fd);
+    return env->NewByteArray(0);
+  }
+  if (want > 4096) want = 4096;
+
+  unsigned char buf[4096];
+  ssize_t n = read(fd, buf, (size_t)want);
+  close(fd);
+  if (n < 0) return nullptr;
+
+  jbyteArray out = env->NewByteArray((jsize)n);
+  if (!out) return nullptr;
+  env->SetByteArrayRegion(out, 0, (jsize)n, (const jbyte*)buf);
+  return out;
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_xwaaa_resig_NativeRedirector_readlinkFdForTest(JNIEnv* env, jclass, jint fd) {
+  if (fd < 0) return nullptr;
+  char linkPath[64];
+  snprintf(linkPath, sizeof(linkPath), "/proc/self/fd/%d", (int)fd);
+  char out[512];
+  ssize_t n = readlink(linkPath, out, sizeof(out) - 1);
+  if (n < 0) return nullptr;
+  out[n] = '\0';
+  return env->NewStringUTF(out);
 }

@@ -116,8 +116,48 @@ tasks.matching { it.name == "mergeDebugAssets" }.configureEach {
     dependsOn(syncKillsigntureSoToAssetsDebug)
 }
 
+tasks.matching { it.name == "generateDebugLintReportModel" }.configureEach {
+    dependsOn(syncKillsigntureSoToAssetsDebug)
+}
+
+tasks.matching { it.name == "lintAnalyzeDebug" }.configureEach {
+    dependsOn(syncKillsigntureSoToAssetsDebug)
+}
+
 tasks.matching { it.name == "mergeReleaseAssets" }.configureEach {
     dependsOn(syncKillsigntureSoToAssetsRelease)
+}
+
+tasks.matching { it.name == "generateReleaseLintReportModel" }.configureEach {
+    dependsOn(syncKillsigntureSoToAssetsRelease)
+}
+
+tasks.matching { it.name == "lintAnalyzeRelease" }.configureEach {
+    dependsOn(syncKillsigntureSoToAssetsRelease)
+}
+
+val payloadAars by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+
+val preparePayloadDeps = tasks.register("preparePayloadDeps") {
+    val outDir = layout.buildDirectory.dir("payload-deps")
+    outputs.dir(outDir)
+    inputs.files(payloadAars)
+
+    doLast {
+        val dir = outDir.get().asFile
+        dir.mkdirs()
+        payloadAars.files.forEach { aar ->
+            if (!aar.name.endsWith(".aar")) return@forEach
+            copy {
+                from(zipTree(aar).matching { include("classes.jar") })
+                into(dir)
+                rename { "${aar.nameWithoutExtension}.jar" }
+            }
+        }
+    }
 }
 
 dependencies {
@@ -138,10 +178,6 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 
-    implementation("com.google.guava:guava:31.1-android")
-    implementation("com.beust:jcommander:1.81")
-
-
 //    implementation("org.smali:baksmali:2.5.2")
 //    implementation("org.smali:smali:2.5.2")
 //    implementation("org.smali:dexlib2:2.5.2")
@@ -150,7 +186,7 @@ dependencies {
     implementation("org.antlr:antlr-runtime:3.5.2")
 
     // ★ 命令行参数解析库（baksmali/smali 使用）
-    implementation("com.beust:jcommander:1.78")
+    implementation("com.beust:jcommander:1.81")
 
     // ★ Guava（dexlib2 用）
     implementation("com.google.guava:guava:31.1-android")
@@ -162,9 +198,11 @@ dependencies {
 
     implementation("net.lingala.zip4j:zip4j:2.11.5")
 
+    implementation("top.canyie.pine:core:0.3.0")
+    implementation("top.canyie.pine:xposed:0.2.0")
+    implementation("top.canyie.pine:enhances:0.1.0")
 
-
-
-
-
+    payloadAars("top.canyie.pine:core:0.3.0")
+    payloadAars("top.canyie.pine:xposed:0.2.0")
+    payloadAars("top.canyie.pine:enhances:0.1.0")
 }

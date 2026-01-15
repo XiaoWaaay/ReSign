@@ -46,6 +46,39 @@ echo "当前目录: $CURDIR"
 echo "使用 android.jar: $PLATFORM_JAR"
 echo "使用 d8: $D8"
 
+DEPS_DIR="$CURDIR/app/build/payload-deps"
+EXTRA_CP=""
+EXTRA_D8_INPUTS=()
+
+if [ ! -d "$DEPS_DIR" ] || ! ls "$DEPS_DIR"/*.jar >/dev/null 2>&1; then
+  if [ -f "$CURDIR/gradlew" ]; then
+    JAVA_MAJOR=""
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME:-}/bin/java" ]; then
+      JAVA_MAJOR="$("$JAVA_HOME/bin/java" -version 2>&1 | head -n 1 | sed -n 's/.*version \"\\([0-9][0-9]*\\)\\..*/\\1/p')"
+      if [ -z "$JAVA_MAJOR" ]; then
+        JAVA_MAJOR="$("$JAVA_HOME/bin/java" -version 2>&1 | head -n 1 | sed -n 's/.*version \"1\\.\\([0-9][0-9]*\\)\\..*/\\1/p')"
+      fi
+    fi
+
+    if [ -z "${JAVA_HOME:-}" ] || [ -z "$JAVA_MAJOR" ] || [ "$JAVA_MAJOR" -lt 17 ] || [ "$JAVA_MAJOR" -gt 21 ]; then
+      CAND="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+      if [ -d "$CAND" ]; then
+        export JAVA_HOME="$CAND"
+        export PATH="$JAVA_HOME/bin:$PATH"
+      fi
+    fi
+
+    "$CURDIR/gradlew" :app:preparePayloadDeps
+  fi
+fi
+
+if [ -d "$DEPS_DIR" ] && ls "$DEPS_DIR"/*.jar >/dev/null 2>&1; then
+  for j in "$DEPS_DIR"/*.jar; do
+    EXTRA_CP="${EXTRA_CP:+$EXTRA_CP:}$j"
+    EXTRA_D8_INPUTS+=("$j")
+  done
+fi
+
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/classes"
 mkdir -p "$OUT_DIR/dex"
@@ -55,7 +88,12 @@ set +e
 JAVA_SRC="$OUT_DIR/HookApplication.java"
 cp "$CURDIR/$JAVA_FILE" "$JAVA_SRC"
 
-javac -encoding UTF-8 -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" -d "$OUT_DIR/classes" "$JAVA_SRC"
+CP="$PLATFORM_JAR"
+if [ -n "$EXTRA_CP" ]; then
+  CP="$PLATFORM_JAR:$EXTRA_CP"
+fi
+
+javac -encoding UTF-8 -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$CP" -d "$OUT_DIR/classes" "$JAVA_SRC"
 JAVAC_EXIT=$?
 set -e
 if [ $JAVAC_EXIT -ne 0 ]; then
@@ -67,7 +105,7 @@ echo "打包为 JAR..."
 jar cf "$OUT_DIR/hook.jar" -C "$OUT_DIR/classes" .
 
 echo "转换为 DEX..."
-"$D8" --min-api 21 --output "$OUT_DIR/dex" --lib "$PLATFORM_JAR" "$OUT_DIR/hook.jar"
+"$D8" --min-api 21 --output "$OUT_DIR/dex" --lib "$PLATFORM_JAR" "$OUT_DIR/hook.jar" "${EXTRA_D8_INPUTS[@]}"
 
 if [ -f "$OUT_DIR/dex/classes.dex" ]; then
   echo

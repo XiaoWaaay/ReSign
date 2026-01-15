@@ -1,26 +1,32 @@
 package com.xwaaa.resig
 
-// 只保留 zip4j，避免 ZipFile 名称冲突
-
 import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.wind.meditor.ManifestEditorMain
-import net.lingala.zip4j.ZipFile
-import net.lingala.zip4j.model.ZipParameters
-import net.lingala.zip4j.model.enums.CompressionLevel
-import net.lingala.zip4j.model.enums.CompressionMethod
-import org.jf.baksmali.Main
-import org.jf.dexlib2.DexFileFactory
-import org.jf.dexlib2.Opcodes
-import org.jf.dexlib2.dexbacked.DexBackedClassDef
-import org.jf.dexlib2.dexbacked.DexBackedDexFile
 import java.io.*
 import java.nio.file.Files
 import java.nio.file.Paths
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
-import org.jf.smali.Main as SmaliMain
+import org.jf.dexlib2.Opcodes
+import org.jf.dexlib2.ReferenceType
+import org.jf.dexlib2.dexbacked.DexBackedDexFile
+import org.jf.dexlib2.iface.instruction.Instruction
+import org.jf.dexlib2.iface.instruction.ReferenceInstruction
+import org.jf.dexlib2.iface.instruction.formats.Instruction21c
+import org.jf.dexlib2.iface.instruction.formats.Instruction31c
+import org.jf.dexlib2.iface.reference.StringReference
+import org.jf.dexlib2.iface.value.EncodedValue
+import org.jf.dexlib2.iface.value.StringEncodedValue
+import org.jf.dexlib2.immutable.instruction.ImmutableInstruction21c
+import org.jf.dexlib2.immutable.instruction.ImmutableInstruction31c
+import org.jf.dexlib2.immutable.reference.ImmutableStringReference
+import org.jf.dexlib2.immutable.value.ImmutableStringEncodedValue
+import org.jf.dexlib2.rewriter.DexRewriter
+import org.jf.dexlib2.rewriter.Rewriter
+import org.jf.dexlib2.rewriter.RewriterModule
+import org.jf.dexlib2.rewriter.Rewriters
+import org.jf.dexlib2.writer.io.FileDataStore
+import org.jf.dexlib2.writer.pool.DexPool
 
 
 class Injector {
@@ -28,74 +34,62 @@ class Injector {
     companion object {
         private const val TAG = "DexInjector"
         private const val MANIFEST_NAME = "AndroidManifest.xml"
-        // ---------------- 入口函数 ----------------
-        fun injectDex(dexDir: String, xmlPath: String) {
-            Log.d(TAG, "开始注入 dex 代码")
-            val appName = getApplicationName(xmlPath)
-            if (appName == null) {
-                editAName(xmlPath, "com.xwaaa.hook.HookApplication");
-                Log.w(TAG, "未找到 application name，主动修改为com.xwaaa.hook.HookApplication")
-                return
-            }
-            Log.d(TAG,"要修改的类是："+appName)
+        private const val HOOK_APPLICATION = "com.xwaaa.hook.HookApplication"
+        private const val HOOK_COMPONENT_FACTORY = "com.xwaaa.hook.HookApplication\$DelegatingAppComponentFactory"
+        // Manifest 入口替换模式：不对目标 dex 反编译/插桩，稳定性更高
+        fun injectByManifest(xmlPath: String, metaDataList: List<String> = emptyList()) {
+            Log.d(TAG, "开始注入（Manifest 入口替换模式）")
+            editManifestEntry(xmlPath, HOOK_APPLICATION, HOOK_COMPONENT_FACTORY, metaDataList)
+        }
 
-            val dest = appName.replace(".", "/")
-            val targetClassPath = "L$dest;"
-            Log.d(TAG, "🔍 目标 Application 类: $targetClassPath")
-            val dexFiles = File(dexDir).listFiles(FileFilter { it.name.endsWith(".dex") }) ?: emptyArray()
-            var targetDex: File? = null
-            for (file in dexFiles) {
-                val dexFile: DexBackedDexFile = DexFileFactory.loadDexFile(file, Opcodes.forApi(28))
-                for (cls: DexBackedClassDef in dexFile.classes) {
-                    if (cls.type == targetClassPath) {
-                        targetDex = file
-                        break
-                    }
-                }
-                if (targetDex != null) break
+        fun editManifestEntry(
+            xmlPath: String,
+            applicationClassName: String,
+            appComponentFactoryClassName: String?,
+            metaDataList: List<String> = emptyList()
+        ) {
+            val attrs = ArrayList<String>(2)
+            attrs.add("android-name:$applicationClassName")
+            if (!appComponentFactoryClassName.isNullOrBlank()) {
+                attrs.add("android-appComponentFactory:$appComponentFactoryClassName")
             }
-
-            if (targetDex == null) {
-                Log.w(TAG, "❌ 未找到目标 dex 文件，无法注入")
-                return
-            }
-            Log.d(TAG, "✅ 找到目标 dex: ${targetDex.name}")
-            // 反编译 dex → smali 目录
-            val smaliDir = File(targetDex.parentFile, "smali")
-            Main.main(arrayOf("d", targetDex.absolutePath, "-o", smaliDir.absolutePath))
-            Log.d(TAG, "✅ 已反编译到: ${smaliDir.absolutePath}")
-
-            // 定位 smali 文件路径
-            val smaliPath = File(smaliDir, "$dest.smali").absolutePath
-            val smaliFile = File(smaliPath)
-            if (!smaliFile.exists()) {
-                Log.e(TAG, "❌ 找不到 smali 文件: $smaliPath")
-                return
-            }
-            // 注入 Hook 初始化逻辑
-            injectHookInit(smaliFile.absolutePath)
-
-            // 回编译 smali → 新 dex
-            val newDexFile = File(targetDex.parentFile, "out.dex")
-            SmaliMain.main(arrayOf("a", smaliDir.absolutePath, "-o", newDexFile.absolutePath))
-            Log.d(TAG, "✅ smali 回编译完成: ${newDexFile.absolutePath}")
-            // 替换原 dex
-            if (newDexFile.exists()) {
-                targetDex.delete()
-                newDexFile.renameTo(targetDex)
-                Log.d(TAG, "✅ dex 文件替换完成: ${targetDex.name}")
-            } else {
-                Log.e(TAG, "❌ 新 dex 未生成，注入失败")
-            }
-            // 清理 smali 残留
-            smaliDir.deleteRecursively()
-            Log.d(TAG, "🧹 清理 smali 临时目录完成")
-
+            val out = ManifestEditor.edit(
+                xmlPath,
+                ManifestEditor.Options(
+                    output = "$xmlPath.bak",
+                    applicationAttributeList = attrs,
+                    metaDataList = metaDataList,
+                    forceOverwrite = true,
+                    needSignApk = false
+                )
+            )
+            deleteDirectory(File(xmlPath))
+            renameFile(File(out), File(xmlPath))
         }
 
         // ---------------- 获取 Application 名称 ----------------
         fun getApplicationName(filePath: String): String? {
             return getValue(filePath, "application", "android", "name")
+        }
+
+        fun getManifestPackageName(filePath: String): String? {
+            return getValue(filePath, "manifest", "", "package")
+        }
+
+        fun getAppComponentFactoryName(filePath: String): String? {
+            return getValue(filePath, "application", "android", "appComponentFactory")
+        }
+
+        private fun normalizeClassName(raw: String, manifestPackageName: String?): String {
+            val v = raw.trim()
+            if (v.isEmpty()) return v
+            val pkg = manifestPackageName?.trim().orEmpty()
+
+            if (v.startsWith(".")) {
+                return if (pkg.isEmpty()) v.drop(1) else pkg + v
+            }
+            if (v.contains(".")) return v
+            return if (pkg.isEmpty()) v else "$pkg.$v"
         }
 
         // ---------------- 通用属性读取函数 ----------------
@@ -144,7 +138,7 @@ class Injector {
         }
 
         //添加自定义的类
-        open fun editAName(file: String, newName: String?) {
+        fun editAName(file: String, newName: String?) {
             ManifestEditorMain.main(file, "-an", newName, "-o", "$file.bak")
             deleteDirectory(File(file))
             renameFile(File("$file.bak"), File(file))
@@ -156,6 +150,14 @@ class Injector {
                 newFile.delete()
             }
             return oldFile.renameTo(newFile)
+        }
+
+        private fun deleteDirectory(dir: File) {
+            if (!dir.exists()) return
+            if (dir.isDirectory) {
+                dir.listFiles()?.forEach { deleteDirectory(it) }
+            }
+            dir.delete()
         }
 
 //        fun injectHookInit(smaliFilePath: String) {
@@ -171,226 +173,145 @@ class Injector {
 //            |    # === 注入 HookApplication 初始化 ===
 //            |    invoke-static {}, Lcom/xwaaa/hook/HookApplication;->initSignatureHook()V
 //            |
-//        """.trimMargin()
-//
-//            val pattern = Regex(""".method static constructor <clinit>\(\)V\s*\.registers\s+(\d+)""")
-//            val match = pattern.find(content)
-//
-//            val modifiedContent = if (match != null) {
-//                // 如果已有静态构造方法，则注入 hook 调用
-//                val registers = match.groupValues[1].toInt().coerceAtLeast(1)
-//                pattern.replace(content) {
-//                    """
-//                |.method static constructor <clinit>()V
-//                |    .registers $registers
-//                |$hookCode
-//                """.trimMargin()
-//                }
-//            } else {
-//                // 否则新增一个新的 <clinit>() 方法
-//                """
-//            |$content
-//            |
-//            |.method static constructor <clinit>()V
-//            |    .registers 1
-//            |$hookCode
-//            |    return-void
-//            |.end method
-//            """.trimMargin()
-//            }
-//
-//            file.writeText(modifiedContent)
-//            Log.d(TAG, "✅ 已在 $smaliFilePath 注入 Hook 初始化代码")
-//        }
-
-        fun injectHookInit(smaliFilePath: String) {
-            val file = File(smaliFilePath)
-            if (!file.exists()) {
-                Log.e(TAG, "找不到 smali 文件: $smaliFilePath")
-                return
-            }
-
-            val content = file.readText()
-
-            val hookCodeInExistingClinit = """
-        |
-        |    :resig_try_start
-        |    const-string v0, "com.xwaaa.hook.HookApplication"
-        |    invoke-static {v0}, Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;
-        |    move-result-object v0
-        |
-        |    const-string v1, "initSignatureHook"
-        |    const/4 v2, 0x0
-        |    new-array v2, v2, [Ljava/lang/Class;
-        |    invoke-virtual {v0, v1, v2}, Ljava/lang/Class;->getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
-        |    move-result-object v0
-        |
-        |    const/4 v1, 0x1
-        |    invoke-virtual {v0, v1}, Ljava/lang/reflect/Method;->setAccessible(Z)V
-        |
-        |    const/4 v1, 0x0
-        |    invoke-virtual {v0, v1, v1}, Ljava/lang/reflect/Method;->invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
-        |    :resig_try_end
-        |    .catch Ljava/lang/Exception; {:resig_try_start .. :resig_try_end} :resig_catch
-        |
-        |    goto :resig_after
-        |
-        |    :resig_catch
-        |
-        |    :resig_after
-        |
-    """.trimMargin()
-
-            val hookCodeNewClinit = """
-        |$hookCodeInExistingClinit
-        |    return-void
-        |
-    """.trimMargin()
-
-            val pattern = Regex(""".method static constructor <clinit>\(\)V\s*\.registers\s+(\d+)""")
-            val match = pattern.find(content)
-
-            val modifiedContent = if (match != null) {
-                // 如果已有静态构造方法，则注入 hook 调用
-                val registers = match.groupValues[1].toInt()
-                val neededRegisters = 3 // v0, v1, v2
-                val finalRegisters = if (registers < neededRegisters) neededRegisters else registers
-
-                pattern.replace(content) {
-                    """
-            |.method static constructor <clinit>()V
-            |    .registers $finalRegisters
-            |$hookCodeInExistingClinit
-            """.trimMargin()
-                }
-            } else {
-                // 否则新增一个新的 <clinit>() 方法
-                """
-        |$content
-        |
-        |.method static constructor <clinit>()V
-        |    .registers 3
-        |$hookCodeNewClinit
-        |.end method
-        """.trimMargin()
-            }
-
-            file.writeText(modifiedContent)
-            Log.d(TAG, "✅ 已在 $smaliFilePath 注入 Hook 初始化代码")
-        }
-
         //修改注入的dex中的预设值
-        open fun editShellDEX(DexPath: String, packageName: String?, Sig: String) {
+        fun editShellDEX(DexPath: String, packageName: String?, Sig: String) {
+            editShellDEX(DexPath, packageName, Sig, null, null)
+        }
+
+        fun editShellDEX(DexPath: String, packageName: String?, Sig: String, originalApplicationClass: String?) {
+            editShellDEX(DexPath, packageName, Sig, originalApplicationClass, null)
+        }
+
+        fun editShellDEX(
+            DexPath: String,
+            packageName: String?,
+            Sig: String,
+            originalApplicationClass: String?,
+            originalAppComponentFactoryClass: String?
+        ) {
             val file = File(DexPath)
-            Log.d(TAG, "开始 dex → smali 转换: $DexPath")
-            // 1️⃣ 反编译 dex 为 smali
-            Main.main(
-                arrayOf(
-                    "d",
-                    DexPath,
-                    "-o",
-                    file.parent + File.separator + "smali"
-                )
-            )
-
-            Log.d(TAG, "✅ dex 转 smali 执行完成，开始检查目录结构")
-
-            val smaliDir = File(file.parent, "smali")
-            if (!smaliDir.exists()) {
-                Log.e(TAG, "❌ smali 目录未生成，反编译失败")
+            if (!file.exists() || !file.isFile) {
+                Log.e(TAG, "❌ DexPath 不存在或不是文件: $DexPath")
                 return
             }
 
-            // 3️⃣ 自动搜索 App.smali（避免包名写死）
-            // 自动寻找 HookApplication 或 App.smali
-            val appSmaliFile = smaliDir.walkTopDown()
-                .firstOrNull { it.isFile && (it.name == "App.smali" || it.name == "HookApplication.smali") }
+            val pkg = packageName?.trim().orEmpty()
+            val sig = Sig.trim()
+            val origApp = originalApplicationClass?.trim().orEmpty()
+            val origFactory = originalAppComponentFactoryClass?.trim().orEmpty()
 
-            if (appSmaliFile == null) {
-                Log.e(TAG, "❌ 未找到 HookApplication.smali 或 App.smali，请检查反编译输出")
-                return
-            }
-
-            Log.d(TAG, "✅ 找到目标 smali 文件: ${appSmaliFile.absolutePath}")
-
-
-            // 4️⃣ 替换签名与包名
-            val Sig2: String = Sig.replace("\n", "\\n")
-            replaceInFile(appSmaliFile.absolutePath, "xwaaa.package", packageName)
-            replaceInFile(appSmaliFile.absolutePath, "xwaaa resig", Sig2)
-            Log.d(TAG, "✅ 已修改包名与签名值")
-
-            // 5️⃣ 将 smali 重新编译为 dex
-            Log.d(TAG, "开始 smali → dex 重编译")
-            org.jf.smali.Main.main(
-                arrayOf(
-                    "a",
-                    smaliDir.absolutePath,
-                    "-o",
-                    file.parent + File.separator + "out.dex"
-                )
-            )
-
-            // 6️⃣ 等待 out.dex 生成
-            val outDex = File(file.parent, "out.dex")
-            var waited = 0
-            while (!outDex.exists() && waited < 15000) {
-                Thread.sleep(1000L)
-                waited += 1000
-            }
-
-            if (!outDex.exists()) {
-                Log.e(TAG, "❌ 等待 out.dex 超时，smali 编译失败")
-                return
-            }
-
-            Log.d(TAG, "✅ out.dex 生成完成: ${outDex.absolutePath}")
-
-            // 7️⃣ 删除临时 smali 目录
-            deleteDirectory(smaliDir)
-            Log.d(TAG, "🧹 清理 smali 临时文件完成")
-
-            // 8️⃣ 替换原 dex
-            val success = renameFile(outDex, file)
-            if (success) {
-                Log.d(TAG, "✅ 替换原 dex 成功: ${file.absolutePath}")
-            } else {
-                Log.e(TAG, "❌ 替换原 dex 失败")
-            }
-
-            Log.d(TAG, "✅ editShellDEX 流程完成")
-        }
-
-        //替换文件
-        fun replaceInFile(filePath: String?, target: String?, replacement: String?) {
-            val file = File(filePath)
-            val fileContent = StringBuilder()
-            try {
-                val reader = BufferedReader(FileReader(file))
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    fileContent.append(line.replace(target!!, replacement!!))
-                        .append(System.lineSeparator())
+            val inBytes = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    Files.readAllBytes(Paths.get(DexPath))
+                } else {
+                    FileInputStream(file).use { it.readBytes() }
                 }
-                reader.close()
-            } catch (e: IOException) {
-                e.printStackTrace()
+            } catch (e: Throwable) {
+                Log.e(TAG, "❌ 读取 dex 失败: ${e.message}", e)
+                return
             }
-            try {
-                val writer = BufferedWriter(FileWriter(file))
-                writer.write(fileContent.toString())
-                writer.close()
-            } catch (e2: IOException) {
-                e2.printStackTrace()
-            }
-        }
 
-        //删除临时文件
-        private fun deleteDirectory(dir: File) {
-            if (dir.exists()) {
-                if (dir.isDirectory) dir.listFiles()?.forEach { deleteDirectory(it) }
-                dir.delete()
+            val dexFile = try {
+                DexBackedDexFile(Opcodes.getDefault(), inBytes)
+            } catch (e: Throwable) {
+                Log.e(TAG, "❌ 解析 dex 失败: ${e.message}", e)
+                return
             }
+
+            fun replacePlaceholder(s: String): String? {
+                return when (s) {
+                    "xwaaa.package" -> pkg
+                    "xwaaa resig" -> sig
+                    "xwaaa.original_app" -> origApp
+                    "xwaaa.original_factory" -> origFactory
+                    else -> null
+                }
+            }
+
+            val module = object : RewriterModule() {
+                override fun getInstructionRewriter(rewriters: Rewriters): Rewriter<Instruction> {
+                    val base = super.getInstructionRewriter(rewriters)
+                    return Rewriter { value ->
+                        val ins = base.rewrite(value)
+                        if (ins is ReferenceInstruction && ins.referenceType == ReferenceType.STRING) {
+                            val ref = ins.reference
+                            if (ref is StringReference) {
+                                val replaced = replacePlaceholder(ref.string)
+                                if (replaced != null) {
+                                    if (ins is Instruction21c) {
+                                        return@Rewriter ImmutableInstruction21c(ins.opcode, ins.registerA, ImmutableStringReference(replaced))
+                                    }
+                                    if (ins is Instruction31c) {
+                                        return@Rewriter ImmutableInstruction31c(ins.opcode, ins.registerA, ImmutableStringReference(replaced))
+                                    }
+                                }
+                            }
+                        }
+                        ins
+                    }
+                }
+
+                override fun getEncodedValueRewriter(rewriters: Rewriters): Rewriter<EncodedValue> {
+                    val base = super.getEncodedValueRewriter(rewriters)
+                    return Rewriter { value ->
+                        val v = base.rewrite(value)
+                        if (v is StringEncodedValue) {
+                            val replaced = replacePlaceholder(v.value)
+                            if (replaced != null) {
+                                return@Rewriter ImmutableStringEncodedValue(replaced)
+                            }
+                        }
+                        v
+                    }
+                }
+            }
+
+            val rewriters = DexRewriter(module)
+            val rewritten = rewriters.getDexFileRewriter().rewrite(dexFile)
+            val tmpOut = File(file.parentFile, file.name + ".patched")
+            try {
+                val pool = DexPool(dexFile.opcodes)
+                for (cls in rewritten.classes) {
+                    pool.internClass(cls)
+                }
+                pool.writeTo(FileDataStore(tmpOut))
+            } catch (e: Throwable) {
+                Log.e(TAG, "❌ 写回 dex 失败: ${e.message}", e)
+                try {
+                    tmpOut.delete()
+                } catch (_: Throwable) {
+                }
+                return
+            }
+
+            try {
+                if (!tmpOut.renameTo(file)) {
+                    FileInputStream(tmpOut).use { input ->
+                        FileOutputStream(file).use { output ->
+                            val buf = ByteArray(256 * 1024)
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n < 0) break
+                                if (n > 0) output.write(buf, 0, n)
+                            }
+                            try {
+                                output.fd.sync()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                    tmpOut.delete()
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "❌ 覆盖 dex 失败: ${e.message}", e)
+                try {
+                    tmpOut.delete()
+                } catch (_: Throwable) {
+                }
+                return
+            }
+
+            Log.d(TAG, "✅ editShellDEX 完成: ${file.absolutePath} size=${file.length()}")
         }
 
         //=============================================================================
