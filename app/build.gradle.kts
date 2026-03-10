@@ -218,6 +218,11 @@ dependencies {
     // ZIP处理
     implementation("net.lingala.zip4j:zip4j:2.11.5")
 
+    // APK签名
+    implementation("com.android.tools.build:apksig:8.2.2")
+    implementation("org.bouncycastle:bcpkix-jdk15to18:1.70")
+    implementation("org.bouncycastle:bcprov-jdk15to18:1.70")
+
     // Manifest编辑
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
 

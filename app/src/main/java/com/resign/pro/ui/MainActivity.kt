@@ -127,7 +127,7 @@ fun MainScreen() {
     var hookMode by remember { mutableStateOf(PackEngine.HookMode.STANDARD) }
     var nativeBackend by remember { mutableStateOf("plt_hook") }
     var enableAntiDetect by remember { mutableStateOf(true) }
-    var preserveSignBlock by remember { mutableStateOf(true) }
+    var preserveSignBlock by remember { mutableStateOf(false) }
 
     // 加载应用列表
     LaunchedEffect(Unit) {
@@ -660,9 +660,9 @@ fun RepackTab(
                         openApk(context, outFile)
                     }
                 ) {
-                    Icon(Icons.Filled.OpenInNew, contentDescription = null)
+                    Icon(Icons.Filled.SystemUpdateAlt, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("打开")
+                    Text("安装 APK")
                 }
 
                 OutlinedButton(
@@ -706,7 +706,7 @@ fun RepackTab(
                 ) {
                     Icon(Icons.Filled.FolderOpen, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("打开目录")
+                    Text("打开所在文件夹")
                 }
             }
         } else {

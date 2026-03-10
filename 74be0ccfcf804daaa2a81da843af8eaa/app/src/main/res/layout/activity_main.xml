@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center"
+    tools:context=".MainActivity">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="ReSign V3 - Signature Test"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:textColor="#333333"
+        android:layout_marginBottom="32dp" />
+
+    <!-- 签名校验结果 (来自 native-lib JNI_OnLoad) -->
+    <TextView
+        android:id="@+id/sample_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="checking..."
+        android:textSize="18sp"
+        android:textColor="#333333"
+        android:textStyle="bold"
+        android:padding="20dp"
+        android:gravity="center"
+        android:background="#F0F0F0"
+        android:layout_marginBottom="24dp" />
+
+    <!-- 分隔线 -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#DDDDDD"
+        android:layout_marginBottom="16dp" />
+
+    <!-- SignatureKiller 状态 -->
+    <TextView
+        android:id="@+id/tv_killer_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="SignatureKiller Status: checking..."
+        android:textSize="13sp"
+        android:textColor="#666666"
+        android:fontFamily="monospace"
+        android:padding="12dp"
+        android:background="#F8F8F8"
+        android:lineSpacingMultiplier="1.4" />
+
+</LinearLayout>

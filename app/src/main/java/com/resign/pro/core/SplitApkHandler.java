@@ -127,7 +127,7 @@ public class SplitApkHandler {
 
             // 重签名（使用与base相同的签名）
             try {
-                ApkSigner.signV1(outputSplit, context);
+                ApkSigner.sign(outputSplit, context);
                 Logger.i(TAG, "Split签名完成: " + split.name);
             } catch (Exception e) {
                 Logger.w(TAG, "Split签名失败: " + split.name + " - " + e.getMessage());

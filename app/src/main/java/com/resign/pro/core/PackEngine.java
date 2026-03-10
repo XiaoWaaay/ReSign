@@ -55,7 +55,7 @@ public class PackEngine {
         public HookMode hookMode = HookMode.STANDARD;
         public NativeBackend nativeBackend = NativeBackend.PLT;
         public boolean handleSplits = true;
-        public boolean preserveSigningBlock = true;
+        public boolean preserveSigningBlock = false;
     }
 
     public enum HookMode {
@@ -427,18 +427,15 @@ public class PackEngine {
     private void handleSigning(File apk) throws Exception {
         if (config.preserveSigningBlock) {
             try {
-                // 尝试保留原始APK的Signing Block
                 ApkSigningBlock.preserveSigningBlock(new File(targetApkPath), apk);
-                Logger.i(TAG, "APK Signing Block保留成功");
-                return;
+                Logger.i(TAG, "APK Signing Block已插入（仅用于欺骗存在性检测）");
             } catch (Exception e) {
-                Logger.w(TAG, "Signing Block保留失败，回退到V1签名: " + e.getMessage());
+                Logger.w(TAG, "Signing Block插入失败: " + e.getMessage());
             }
         }
 
-        // 使用V1签名（JAR签名）
-        ApkSigner.signV1(apk, context);
-        Logger.i(TAG, "V1签名完成");
+        ApkSigner.sign(apk, context);
+        Logger.i(TAG, "签名完成");
     }
 
     /**

@@ -297,16 +297,11 @@ public class HookEntry extends Application {
     // -------- STANDARD级Hook --------
 
     private void installStandardHooks(Context ctx) throws Throwable {
-        // 1. Hook PackageInfo的Parcelable CREATOR
-        hookParcelableCreator(PackageInfo.class, "PackageInfo");
-
-        // 2. Hook Signature的Parcelable CREATOR
-        hookParcelableCreator(Signature.class, "Signature");
-
-        // 3. API 28+: Hook SigningInfo CREATOR
+        hookPackageInfoCreator();
+        hookSignatureCreator();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             try {
-                hookParcelableCreator(SigningInfo.class, "SigningInfo");
+                hookSigningInfoCreator();
             } catch (Throwable t) {
                 logd("STANDARD: SigningInfo CREATOR hook跳过: " + t.getMessage());
             }
@@ -465,6 +460,20 @@ public class HookEntry extends Application {
             mPMField.setAccessible(true);
             mPMField.set(pm, proxy);
 
+            try {
+                Context appCtx = ctx.getApplicationContext();
+                if (appCtx != null && appCtx != ctx) {
+                    PackageManager pm2 = appCtx.getPackageManager();
+                    Field mPMField2 = pm2.getClass().getDeclaredField("mPM");
+                    mPMField2.setAccessible(true);
+                    Object cur = mPMField2.get(pm2);
+                    if (cur != proxy) {
+                        mPMField2.set(pm2, proxy);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+
             logd("Binder代理安装完成");
         } catch (Throwable t) {
             logd("Binder代理安装失败: " + t.getMessage());
@@ -481,9 +490,37 @@ public class HookEntry extends Application {
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-            Object result = method.invoke(original, args);
-
             String name = method.getName();
+
+            if ("checkSignatures".equals(name) && args != null && args.length >= 2) {
+                if (TARGET_PKG.equals(args[0]) || TARGET_PKG.equals(args[1])) {
+                    return PackageManager.SIGNATURE_MATCH;
+                }
+            }
+
+            if ("checkUidSignatures".equals(name) && args != null && args.length >= 2) {
+                try {
+                    int myUid = android.os.Process.myUid();
+                    if ((args[0] instanceof Integer && (int) args[0] == myUid)
+                            || (args[1] instanceof Integer && (int) args[1] == myUid)) {
+                        return PackageManager.SIGNATURE_MATCH;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            if ("hasSigningCertificate".equals(name) && args != null && args.length >= 1) {
+                if (TARGET_PKG.equals(args[0])) {
+                    return true;
+                }
+            }
+
+            Object result;
+            try {
+                result = method.invoke(original, args);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                throw e.getTargetException();
+            }
 
             // 拦截返回PackageInfo的方法
             if (result instanceof PackageInfo) {
@@ -493,25 +530,105 @@ public class HookEntry extends Application {
                 }
             }
 
-            // 拦截checkSignatures
-            if ("checkSignatures".equals(name) && args != null && args.length >= 2) {
-                if (TARGET_PKG.equals(args[0]) || TARGET_PKG.equals(args[1])) {
-                    return PackageManager.SIGNATURE_MATCH;
-                }
-            }
-
-            // 拦截hasSigningCertificate
-            if ("hasSigningCertificate".equals(name) && args != null && args.length >= 1) {
-                if (TARGET_PKG.equals(args[0])) {
-                    return true;
-                }
-            }
-
             return result;
         }
     }
 
     // ==================== Parcelable CREATOR Hook ====================
+
+    @SuppressWarnings("unchecked")
+    private void hookPackageInfoCreator() {
+        try {
+            Field creatorField = PackageInfo.class.getDeclaredField("CREATOR");
+            creatorField.setAccessible(true);
+            final Parcelable.Creator<PackageInfo> originalCreator =
+                    (Parcelable.Creator<PackageInfo>) creatorField.get(null);
+
+            Parcelable.Creator<PackageInfo> hookedCreator = new Parcelable.Creator<PackageInfo>() {
+                @Override
+                public PackageInfo createFromParcel(Parcel source) {
+                    PackageInfo pi = originalCreator.createFromParcel(source);
+                    if (pi != null && TARGET_PKG.equals(pi.packageName)) {
+                        patchPackageInfoSignatures(pi);
+                    }
+                    return pi;
+                }
+
+                @Override
+                public PackageInfo[] newArray(int size) {
+                    return originalCreator.newArray(size);
+                }
+            };
+
+            setStaticFinalField(creatorField, hookedCreator);
+            syncParcelCreatorCache(PackageInfo.class, hookedCreator);
+            logd("STANDARD: hook PackageInfo CREATOR");
+        } catch (Throwable t) {
+            logd("PackageInfo CREATOR hook失败: " + t.getMessage());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void hookSignatureCreator() {
+        try {
+            Field creatorField = Signature.class.getDeclaredField("CREATOR");
+            creatorField.setAccessible(true);
+            final Parcelable.Creator<Signature> originalCreator =
+                    (Parcelable.Creator<Signature>) creatorField.get(null);
+
+            Parcelable.Creator<Signature> hookedCreator = new Parcelable.Creator<Signature>() {
+                @Override
+                public Signature createFromParcel(Parcel source) {
+                    Signature dummy = originalCreator.createFromParcel(source);
+                    if (sCachedSignatures != null && sCachedSignatures.length > 0) {
+                        return sCachedSignatures[0];
+                    }
+                    return dummy;
+                }
+
+                @Override
+                public Signature[] newArray(int size) {
+                    return originalCreator.newArray(size);
+                }
+            };
+
+            setStaticFinalField(creatorField, hookedCreator);
+            syncParcelCreatorCache(Signature.class, hookedCreator);
+            logd("STANDARD: hook Signature CREATOR");
+        } catch (Throwable t) {
+            logd("Signature CREATOR hook失败: " + t.getMessage());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void hookSigningInfoCreator() {
+        try {
+            Field creatorField = SigningInfo.class.getDeclaredField("CREATOR");
+            creatorField.setAccessible(true);
+            final Parcelable.Creator<SigningInfo> originalCreator =
+                    (Parcelable.Creator<SigningInfo>) creatorField.get(null);
+
+            Parcelable.Creator<SigningInfo> hookedCreator = new Parcelable.Creator<SigningInfo>() {
+                @Override
+                public SigningInfo createFromParcel(Parcel source) {
+                    SigningInfo si = originalCreator.createFromParcel(source);
+                    patchSigningInfo(si);
+                    return si;
+                }
+
+                @Override
+                public SigningInfo[] newArray(int size) {
+                    return originalCreator.newArray(size);
+                }
+            };
+
+            setStaticFinalField(creatorField, hookedCreator);
+            syncParcelCreatorCache(SigningInfo.class, hookedCreator);
+            logd("STANDARD: hook SigningInfo CREATOR");
+        } catch (Throwable t) {
+            logd("SigningInfo CREATOR hook失败: " + t.getMessage());
+        }
+    }
 
     /** 通用的Parcelable CREATOR hook */
     @SuppressWarnings("unchecked")
@@ -579,6 +696,16 @@ public class HookEntry extends Application {
             Object base = staticFieldBase.invoke(unsafe, field);
             putObject.invoke(unsafe, base, offset, value);
         } catch (Exception e) {
+            try {
+                Field accessFlagsField = Field.class.getDeclaredField("accessFlags");
+                accessFlagsField.setAccessible(true);
+                int flags = accessFlagsField.getInt(field);
+                accessFlagsField.setInt(field, flags & ~0x10);
+                field.set(null, value);
+                return;
+            } catch (Exception ignored) {
+            }
+
             // 最后手段：修改modifiers
             try {
                 Field modifiersField = Field.class.getDeclaredField("modifiers");
@@ -593,32 +720,47 @@ public class HookEntry extends Application {
 
     /** 同步Parcel内部的CREATOR缓存映射 */
     private static void syncParcelCreatorCache(Class<?> clazz, Parcelable.Creator<?> newCreator) {
+        String key = clazz.getName();
+        try {
+            Field mCreators = Parcel.class.getDeclaredField("mCreators");
+            mCreators.setAccessible(true);
+            Object cache = mCreators.get(null);
+            if (cache instanceof Map) {
+                for (Object inner : ((Map<?, ?>) cache).values()) {
+                    if (inner instanceof Map) {
+                        ((Map<String, Object>) inner).put(key, newCreator);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
         try {
             Field cacheField = Parcel.class.getDeclaredField("sPairedCreators");
             cacheField.setAccessible(true);
             Object cache = cacheField.get(null);
             if (cache instanceof Map) {
-                // HashMap<ClassLoader, HashMap<String, Creator>>
                 for (Object inner : ((Map<?, ?>) cache).values()) {
                     if (inner instanceof Map) {
-                        ((Map<String, Object>) inner).put(clazz.getName(), newCreator);
+                        ((Map<String, Object>) inner).put(key, newCreator);
                     }
                 }
             }
         } catch (Throwable ignored) {
-            // sPairedCreators可能不存在于所有Android版本
-            try {
-                Field mCreators = Parcel.class.getDeclaredField("mCreators");
-                mCreators.setAccessible(true);
-                Object cache = mCreators.get(null);
-                if (cache instanceof Map) {
-                    for (Object inner : ((Map<?, ?>) cache).values()) {
-                        if (inner instanceof Map) {
-                            ((Map<String, Object>) inner).put(clazz.getName(), newCreator);
-                        }
+        }
+
+        try {
+            Field sCreators = Parcel.class.getDeclaredField("sCreators");
+            sCreators.setAccessible(true);
+            Object cache = sCreators.get(null);
+            if (cache instanceof Map) {
+                for (Object inner : ((Map<?, ?>) cache).values()) {
+                    if (inner instanceof Map) {
+                        ((Map<String, Object>) inner).put(key, newCreator);
                     }
                 }
-            } catch (Throwable ignored2) {}
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -775,7 +917,7 @@ public class HookEntry extends Application {
             String origApkPath = sOriginApkPath != null ? sOriginApkPath : "";
             String baseApkPath = ctx.getApplicationInfo().sourceDir;
 
-            nativeInit(backend, baseApkPath, origApkPath,
+            nativeInit(backend, baseApkPath, origApkPath, TARGET_PKG,
                     bool(CFG_IO_REDIRECT), bool(CFG_MAPS_HIDE), sDebug);
             logd("Native引擎初始化完成, backend=" + backend);
         } catch (Throwable t) {
@@ -785,8 +927,8 @@ public class HookEntry extends Application {
 
     // Native方法声明
     private static native void nativeInit(String backend, String baseApkPath,
-                                           String originApkPath, boolean ioRedirect,
-                                           boolean mapsHide, boolean debug);
+                                           String originApkPath, String packageName,
+                                           boolean ioRedirect, boolean mapsHide, boolean debug);
 
     // ==================== 自动降级 ====================
 

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ReSign"
+        tools:targetApi="35">
+
+        <!--
+            SignatureKillerProvider: initOrder=999 确保最先初始化
+            在 Application.onCreate 之前完成所有 Hook 安装
+            这样当 MainActivity.static{} 中 System.loadLibrary("native-lib")
+            触发 JNI_OnLoad → getApplication() → getPackageInfo() 时
+            IPackageManager 代理已经就位，返回原始签名
+        -->
+        <provider
+            android:name=".killsig.SignatureKillerProvider"
+            android:authorities="${applicationId}.sigkiller"
+            android:exported="false"
+            android:initOrder="999" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>
