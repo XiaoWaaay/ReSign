@@ -1,3 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">resig</string>
+    <string name="app_name">ReSignPro</string>
+
+    <!-- 通用 -->
+    <string name="confirm">确认</string>
+    <string name="cancel">取消</string>
+    <string name="ok">确定</string>
+    <string name="loading">加载中…</string>
+    <string name="error">错误</string>
+    <string name="success">成功</string>
+    <string name="warning">警告</string>
+
+    <!-- 主界面 -->
+    <string name="tab_apps">应用</string>
+    <string name="tab_repack">重打包</string>
+    <string name="tab_logs">日志</string>
+    <string name="search_hint">搜索应用名或包名…</string>
+    <string name="select_apk">选择 APK 文件</string>
+    <string name="app_count">共 %d 个应用</string>
+
+    <!-- 重打包配置 -->
+    <string name="config_title">重打包配置</string>
+    <string name="hook_mode">Hook 模式</string>
+    <string name="hook_mode_safe">安全模式</string>
+    <string name="hook_mode_safe_desc">仅基本签名欺骗，兼容性最好</string>
+    <string name="hook_mode_standard">标准模式</string>
+    <string name="hook_mode_standard_desc">覆盖大部分签名检测</string>
+    <string name="hook_mode_aggressive">激进模式</string>
+    <string name="hook_mode_aggressive_desc">全量 Hook + IPC 代理</string>
+
+    <string name="native_backend">Native 后端</string>
+    <string name="backend_plt">PLT Hook（推荐）</string>
+    <string name="backend_seccomp">Seccomp BPF</string>
+    <string name="backend_hybrid">混合模式</string>
+
+    <string name="anti_detection">反检测</string>
+    <string name="anti_detection_desc">隐藏重打包痕迹</string>
+    <string name="preserve_sign_block">保留签名块</string>
+    <string name="preserve_sign_block_desc">保留原始 V2/V3 签名块结构</string>
+    <string name="start_repack">开始重打包</string>
+
+    <!-- 重打包进度 -->
+    <string name="repack_idle">选择一个应用开始重打包</string>
+    <string name="repack_complete">重打包完成!</string>
+    <string name="output_file">输出文件:</string>
+
+    <!-- 重打包步骤 -->
+    <string name="step_parse">解析 APK…</string>
+    <string name="step_extract">提取签名信息…</string>
+    <string name="step_copy">复制 APK 文件…</string>
+    <string name="step_inject_dex">注入 Payload DEX…</string>
+    <string name="step_inject_so">注入 Native 库…</string>
+    <string name="step_manifest">修改 AndroidManifest…</string>
+    <string name="step_sign_block">处理签名块…</string>
+    <string name="step_sign">重新签名…</string>
+    <string name="step_align">ZIP 对齐…</string>
+    <string name="step_verify">验证输出…</string>
+
+    <!-- 错误信息 -->
+    <string name="error_no_storage">需要存储权限</string>
+    <string name="error_apk_not_found">APK 文件不存在</string>
+    <string name="error_parse_failed">APK 解析失败</string>
+    <string name="error_repack_failed">重打包失败: %s</string>
 </resources>

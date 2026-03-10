@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Compose 主题由代码定义，此处仅保留 Splash/系统级主题 -->
+    <style name="Theme.ReSignPro" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">@color/primary</item>
+        <item name="android:statusBarColor">@color/surface</item>
+        <item name="android:navigationBarColor">@color/surface</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
 
-    <style name="Theme.Resig" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.ReSignPro.Splash" parent="Theme.ReSignPro">
+        <item name="android:windowBackground">@color/background</item>
+    </style>
 </resources>

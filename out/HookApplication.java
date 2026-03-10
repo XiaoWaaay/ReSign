@@ -346,7 +346,7 @@ public class HookApplication extends Application {
         String v = getStringMeta(context, META_NATIVE_BACKEND, null);
         if (v != null) {
             String s = v.trim().toLowerCase();
-            if (s.equals("dobby") || s.equals("plt")) return 1;
+            if (s.equals("bytehook") || s.equals("dobby") || s.equals("plt")) return 1;
             if (s.equals("seccomp") || s.equals("sigsys")) return 2;
             if (s.equals("hybrid")) return 3;
             int asInt = getIntMeta(context, META_NATIVE_BACKEND, -1);
@@ -365,12 +365,13 @@ public class HookApplication extends Application {
     private static boolean shouldEnableDeepHide(Context context) {
         if (context == null) return false;
         if (sHookMode == HookMode.SAFE) return false;
-        return getBooleanMeta(context, META_ENABLE_DEEP_HIDE, true);
+        return getBooleanMeta(context, META_ENABLE_DEEP_HIDE, false);
     }
 
     private static HookMode applyCrashDowngradeIfNeeded(Context context, HookMode desired) {
         if (context == null) return desired;
-        File state = new File(context.getFilesDir(), CRASH_STATE_FILE);
+        File dir = context.getFilesDir();
+        File state = new File(dir, CRASH_STATE_FILE);
         long now = System.currentTimeMillis();
 
         long lastStart = 0;
@@ -398,10 +399,57 @@ public class HookApplication extends Application {
         } catch (Throwable ignored) {
         }
 
-        if (lastStart > 0 && lastStable < lastStart && now - lastStart <= 5000L) {
+        String currentMarkName = "resig_starting_mark_" + now;
+        File currentMark = new File(dir, currentMarkName);
+        boolean hasRecentOldMark = false;
+        try {
+            File[] marks = dir.listFiles();
+            if (marks != null) {
+                for (File f : marks) {
+                    if (f == null) continue;
+                    String n = f.getName();
+                    if (n == null) continue;
+                    if (!n.startsWith("resig_starting_mark_")) continue;
+                    if (n.equals(currentMarkName)) continue;
+                    long ts = 0;
+                    try {
+                        ts = Long.parseLong(n.substring("resig_starting_mark_".length()));
+                    } catch (Throwable ignored) {
+                    }
+                    if (ts > 0 && now - ts <= 60_000L) {
+                        hasRecentOldMark = true;
+                    }
+                    try {
+                        f.delete();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (hasRecentOldMark) {
             crashCount++;
         } else if (now - lastStable > 60_000L) {
             crashCount = 0;
+        }
+
+        try {
+            FileOutputStream os = new FileOutputStream(currentMark, false);
+            try {
+                os.write(new byte[]{'1'});
+                os.flush();
+                try {
+                    os.getFD().sync();
+                } catch (Throwable ignored) {
+                }
+            } finally {
+                try {
+                    os.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
         }
 
         try {
@@ -425,6 +473,7 @@ public class HookApplication extends Application {
 
         try {
             final File stateFile = state;
+            final File markFile = currentMark;
             new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -434,6 +483,10 @@ public class HookApplication extends Application {
                     }
                     try {
                         long stableNow = System.currentTimeMillis();
+                        try {
+                            markFile.delete();
+                        } catch (Throwable ignored) {
+                        }
                         FileOutputStream os = new FileOutputStream(stateFile, false);
                         try {
                             String out = now + ",0," + stableNow;
